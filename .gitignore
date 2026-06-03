@@ -1,0 +1,11 @@
+sim/
+obj_dir*/
+verification/directed/build/
+verification/formal/reset_drain/
+verification/formal/chi_to_ucie_bridge/
+*.vcd
+*.fst
+*.log
+*.jou
+__pycache__/
+.pytest_cache/

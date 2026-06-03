@@ -1,0 +1,20 @@
+[options]
+mode bmc
+depth 4
+
+[engines]
+smtbmc
+
+[script]
+read_verilog -formal -sv -I. async_fifo.v cdc_sync.v reset_sync.v reset_drain.v credit_counter.v credit_pulse_sync.v chi_to_ucie_bridge.v
+prep -top chi_to_ucie_bridge
+
+[files]
+../../src/async_fifo.v
+../../src/cdc_sync.v
+../../src/reset_sync.v
+../../src/reset_drain.v
+../../src/credit_counter.v
+../../src/credit_pulse_sync.v
+../../src/chi_ucie_bridge_defs.vh
+../../src/chi_to_ucie_bridge.v
