@@ -41,6 +41,12 @@ module chi_to_ucie_bridge_sva (
     (tx_hdr_valid && !tx_hdr_ready && open) |=> (tx_hdr_valid || !open)
   );
 
+  // Payload stability: a stalled TX header holds its value (incl. local tag)
+  // until accepted, so the local tag cannot shift mid-handshake.
+  a_tx_hdr_stable: assert property (
+    (tx_hdr_valid && !tx_hdr_ready && open) |=> ($stable(tx_hdr) || !open)
+  );
+
   // Ordering: write data is never offered before its request header has been
   // issued (i.e. its local tag is queued).
   a_data_after_hdr: assert property (

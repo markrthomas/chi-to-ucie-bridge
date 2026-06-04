@@ -155,9 +155,31 @@ module chi_to_ucie_bridge #(
   // Transaction table (ucie_clk domain)
   // ---------------------------------------------------------------------------
   wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire [LTAG_W-1:0]   alloc_tag;
+  wire [LTAG_W-1:0]   free_tag;
   wire                tbl_full;
   wire                tbl_tag_err;
+
+  // Hold the local tag stable for the whole header handshake. Without this the
+  // presented tag could change mid-stall if a completion frees a lower slot,
+  // violating valid/ready payload stability. Latch free_tag when a header is
+  // first offered; reuse it until the header is accepted.
+  reg  [LTAG_W-1:0]   held_tag;
+  reg                 held_v;
+  wire [LTAG_W-1:0]   present_tag = held_v ? held_tag : free_tag;
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n) begin
+      held_v   <= 1'b0;
+      held_tag <= {LTAG_W{1'b0}};
+    end else if (hdr_fire) begin
+      held_v   <= 1'b0;
+    end else if (ucie_tx_hdr_valid && !ucie_tx_hdr_ready) begin
+      held_tag <= present_tag;
+      held_v   <= 1'b1;
+    end else if (!ucie_tx_hdr_valid) begin
+      held_v   <= 1'b0;
+    end
+  end
 
   wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
   wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
@@ -179,10 +201,11 @@ module chi_to_ucie_bridge #(
   ) u_txn_table (
     .clk(ucie_clk), .rst_n(ucie_rst_n),
     .alloc_en(hdr_fire),
+    .alloc_idx(present_tag),
     .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
     .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
     .alloc_is_write(req_head_is_write),
-    .alloc_tag(alloc_tag),
+    .free_tag(free_tag),
     .full(tbl_full),
     .a_lookup_tag(rx_hdr_tag), .a_free_en(rx_hdr_fire),
     .a_txnid(a_txnid), .a_srcid(a_srcid), .a_is_write(a_is_write), .a_valid(a_valid),
@@ -211,7 +234,7 @@ module chi_to_ucie_bridge #(
       wq_rptr <= {(WQ_AW+1){1'b0}};
     end else begin
       if (wq_push) begin
-        wtag_mem[wq_wptr[WQ_AW-1:0]] <= alloc_tag;
+        wtag_mem[wq_wptr[WQ_AW-1:0]] <= present_tag;
         wq_wptr <= wq_wptr + 1'b1;
       end
       if (wq_pop) wq_rptr <= wq_rptr + 1'b1;
@@ -267,7 +290,7 @@ module chi_to_ucie_bridge #(
   endfunction
 
   assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full;
-  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, alloc_tag});
+  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag});
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty;

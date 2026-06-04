@@ -19,12 +19,15 @@ module txn_table #(
   input  wire                clk,
   input  wire                rst_n,
 
-  // Allocate (on UCIe header issue)
+  // Allocate (on UCIe header issue). The caller chooses the slot (alloc_idx)
+  // and holds it stable across a stalled handshake; free_tag is the suggested
+  // lowest free slot to latch when a header is first presented.
   input  wire                alloc_en,
+  input  wire [LTAG_W-1:0]   alloc_idx,
   input  wire [TID_W-1:0]    alloc_txnid,
   input  wire [SID_W-1:0]    alloc_srcid,
   input  wire                alloc_is_write,
-  output wire [LTAG_W-1:0]   alloc_tag,
+  output wire [LTAG_W-1:0]   free_tag,
   output wire                full,
 
   // Completion A: AD_CPL (request/write completion) lookup + free
@@ -68,8 +71,8 @@ module txn_table #(
     end
   end
 
-  assign full      = !have_free;
-  assign alloc_tag = free_idx;
+  assign full     = !have_free;
+  assign free_tag = free_idx;
 
   // Combinational lookups.
   wire [ENTRY_W-1:0] a_entry = entry[a_lookup_tag];
@@ -95,9 +98,9 @@ module txn_table #(
       tag_err     <= 1'b0;
     end else begin
       for (i = 0; i < N; i = i + 1) begin
-        // set wins only on the freshly chosen free slot (valid[i]==0), so set
-        // and clr never collide on the same index.
-        if (do_alloc && (free_idx == i[LTAG_W-1:0]))
+        // set wins only on a slot the caller guarantees free (valid[i]==0), so
+        // set and clr never collide on the same index.
+        if (do_alloc && (alloc_idx == i[LTAG_W-1:0]))
           valid[i] <= 1'b1;
         else if ((a_free && (a_lookup_tag == i[LTAG_W-1:0])) ||
                  (b_free && (b_lookup_tag == i[LTAG_W-1:0])))
@@ -105,7 +108,7 @@ module txn_table #(
       end
 
       if (do_alloc)
-        entry[free_idx] <= {alloc_is_write, alloc_srcid, alloc_txnid};
+        entry[alloc_idx] <= {alloc_is_write, alloc_srcid, alloc_txnid};
 
       outstanding <= outstanding + alloc_inc - free_dec;
 
@@ -121,20 +124,23 @@ module txn_table #(
     outstanding = {(LTAG_W+1){1'b0}};
   end
 
-  // Environment assumption: a well-behaved link never names the same live tag
-  // on the AD_CPL and MEM_CPL channels in the same cycle (distinct packet
-  // classes), so a single transaction is never double-retired.
+  // Environment assumptions for a well-behaved caller/link:
   always @(posedge clk) begin
+    // The AD_CPL and MEM_CPL channels never name the same live tag in the same
+    // cycle (distinct packet classes), so a transaction is never double-retired.
     if (a_free_en && b_free_en) assume (a_lookup_tag != b_lookup_tag);
+    // The caller only ever allocates a slot it has been told is free (the
+    // bridge latches free_tag, which it keeps reserved until issue).
+    if (alloc_en) assume (!valid[alloc_idx]);
   end
 
   // DUT invariants.
   always @(posedge clk) begin
     if (rst_n) begin
-      // Allocation only ever targets a currently-free slot.
-      if (do_alloc) assert (!valid[free_idx]);
+      // The suggested free slot really is free whenever one exists.
+      if (!full) assert (!valid[free_tag]);
       // The outstanding count never exceeds the table size (no over-allocation,
-      // no decrement underflow given the assumption above).
+      // no decrement underflow given the assumptions above).
       assert (outstanding <= N[LTAG_W:0]);
     end
   end

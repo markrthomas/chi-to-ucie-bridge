@@ -120,14 +120,15 @@ persists while the link stays open; write data never precedes its header.
 - Raise the bridge formal proof from smoke to bounded protocol properties
   (building on the `txn_table` proof already in place).
 
-### Known issue (found via SVA review)
+### Resolved (found via SVA review)
 
-While `ucie_tx_hdr_valid` is asserted and stalled (`!ready`), the local tag in
-the header can change if a completion frees a lower-indexed tag in the meantime,
-because `alloc_tag` tracks the lowest free slot combinationally. Functionally
-harmless (the tag is committed only at issue) but it violates strict
-valid/ready payload stability. Fix candidate: latch the presented tag while a
-header is pending. Tracked for Phase 2 refinement.
+Previously, while `ucie_tx_hdr_valid` was stalled (`!ready`), the local tag in
+the header could change if a completion freed a lower-indexed slot, because the
+presented tag tracked the lowest free slot combinationally — a valid/ready
+payload-stability violation. Fixed: the bridge latches the chosen tag
+(`held_tag`) when a header is first offered and reuses it until acceptance, and
+`txn_table` now allocates that caller-chosen index. The SVA property
+`a_tx_hdr_stable` guards against regression.
 
 ## Phase 4 - Protocol Refinement
 
