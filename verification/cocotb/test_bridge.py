@@ -179,6 +179,24 @@ async def test_read_translates(dut):
     assert field(hdr, UCIE_CODE_LSB, 4) == UCIE_MSG_MEM_RD, "expected MEM_RD"
 
 
+class CoverGroup:
+    """Minimal functional-coverage model: named bins with a hit count and a
+    goal that every bin is exercised at least once."""
+
+    def __init__(self, name, bins):
+        self.name = name
+        self.counts = {b: 0 for b in bins}
+
+    def hit(self, b):
+        self.counts[b] = self.counts.get(b, 0) + 1
+
+    def uncovered(self):
+        return [b for b, c in self.counts.items() if c == 0]
+
+    def report(self):
+        return f"{self.name}{{" + ", ".join(f"{b}={c}" for b, c in self.counts.items()) + "}"
+
+
 class Scoreboard:
     def __init__(self):
         self.outstanding = {}   # txnid -> dict(is_write, addr16, data)
@@ -221,6 +239,8 @@ async def test_random_traffic(dut):
 
     sb = Scoreboard()
     state = dict(running=True)
+    cov_op = CoverGroup("tx_opcode", ["rd", "wr"])
+    cov_cpl = CoverGroup("cpl_class", ["comp", "compdata"])
 
     inuse = set()                 # TxnIDs currently outstanding (must be unique)
     tag_info = {}                 # local tag -> dict(is_write, addr16)
@@ -244,6 +264,7 @@ async def test_random_traffic(dut):
                 code = field(hdr, UCIE_CODE_LSB, 4)
                 addr16 = field(hdr, UCIE_ADDR_LSB, 16)
                 is_write = (code == UCIE_MSG_MEM_WR)
+                cov_op.hit("wr" if is_write else "rd")
                 tag_info[tag] = dict(is_write=is_write, addr16=addr16)
                 if not is_write:
                     # Reads have no data packet; schedule the read completion now.
@@ -313,6 +334,7 @@ async def test_random_traffic(dut):
                 assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_COMP
                 txnid = field(rsp, CHI_RSP_TXNID_LSB, 8)
                 sb.complete_write(txnid)
+                cov_cpl.hit("comp")
                 inuse.discard(txnid)
             await RisingEdge(dut.clk)
 
@@ -327,6 +349,7 @@ async def test_random_traffic(dut):
                 txnid = field(dat, CHI_DAT_TXNID_LSB, 8)
                 data = (dat >> CHI_DAT_DATA_LSB) & MASK512
                 sb.complete_read(txnid, data)
+                cov_cpl.hit("compdata")
                 inuse.discard(txnid)
             await RisingEdge(dut.clk)
 
@@ -384,8 +407,11 @@ async def test_random_traffic(dut):
     assert sb.reads_done + sb.writes_done == N, \
         f"completed {sb.reads_done + sb.writes_done}/{N}"
     assert int(dut.tag_err_cnt.value) == 0, f"tag_err_cnt={int(dut.tag_err_cnt.value)}"
+    assert not cov_op.uncovered(), f"uncovered opcodes: {cov_op.uncovered()}"
+    assert not cov_cpl.uncovered(), f"uncovered completion classes: {cov_cpl.uncovered()}"
     dut._log.info(f"random traffic OK: {sb.reads_done} reads, {sb.writes_done} writes, "
-                  f"crc_err_cnt={int(dut.crc_err_cnt.value)}")
+                  f"crc_err_cnt={int(dut.crc_err_cnt.value)}; "
+                  f"coverage {cov_op.report()} {cov_cpl.report()}")
 
 
 @cocotb.test(timeout_time=2, timeout_unit="ms")
@@ -407,6 +433,8 @@ async def test_random_errors(dut):
     inuse = set()
     expected = {}                 # txnid -> expected data
     pend = []                     # (tag, data, corrupt)
+    cov_csum = CoverGroup("rx_checksum", ["good", "bad"])
+    cov_resp = CoverGroup("read_resperr", ["ok", "derr"])
 
     N = 80
     MAX_INFLIGHT = 12
@@ -425,6 +453,7 @@ async def test_random_errors(dut):
                 corrupt = random.random() < 0.3
                 if corrupt:
                     st["n_corrupt"] += 1
+                cov_csum.hit("bad" if corrupt else "good")
                 pend.append((tag, data_for(addr16), corrupt))
             await RisingEdge(dut.ucie_clk)
 
@@ -462,8 +491,10 @@ async def test_random_errors(dut):
                     st["errors"].append(f"read data mismatch TxnID 0x{txnid:02x}")
                 if resperr == CHI_RESPERR_DERR:
                     st["derr"] += 1
+                    cov_resp.hit("derr")
                 elif resperr == CHI_RESPERR_OK:
                     st["ok"] += 1
+                    cov_resp.hit("ok")
                 else:
                     st["errors"].append(f"unexpected RespErr {resperr}")
                 st["done"] += 1
@@ -509,5 +540,8 @@ async def test_random_errors(dut):
     assert st["ok"] == N - st["n_corrupt"], f"OK completions {st['ok']}"
     assert crc == st["n_corrupt"], f"crc_err_cnt {crc} != corrupted {st['n_corrupt']}"
     assert int(dut.tag_err_cnt.value) == 0, f"tag_err_cnt={int(dut.tag_err_cnt.value)}"
+    assert not cov_csum.uncovered(), f"uncovered checksum bins: {cov_csum.uncovered()}"
+    assert not cov_resp.uncovered(), f"uncovered resperr bins: {cov_resp.uncovered()}"
     dut._log.info(f"random errors OK: {N} reads, {st['n_corrupt']} corrupted -> "
-                  f"{st['derr']} DERR, crc_err_cnt={crc}")
+                  f"{st['derr']} DERR, crc_err_cnt={crc}; "
+                  f"coverage {cov_csum.report()} {cov_resp.report()}")

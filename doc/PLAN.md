@@ -127,10 +127,20 @@ completes (tag freed), corrupted ones carry CHI `RespErr=DERR`, clean ones
 `OK`, and `crc_err_cnt` exactly equals the number of corrupted completions
 delivered (`tag_err_cnt` stays zero).
 
-### 3.4 Next increments
+### 3.4 Functional coverage (done)
 
-- Functional coverage over opcode/status/checksum combinations (Verilator user
-  coverage / cover properties).
+Coverage is collected as a Python model in the cocotb tests (works under the
+Icarus flow that the randomized stimulus runs on) with a pass/fail goal that
+every bin is exercised:
+- `test_random_traffic`: `tx_opcode{rd,wr}`, `cpl_class{comp,compdata}`.
+- `test_random_errors`: `rx_checksum{good,bad}`, `read_resperr{ok,derr}`.
+
+The Verilator `cover property` points (in the SVA module) remain the
+assertion-engine path; they are exercised once the cocotb-on-Verilator issue
+below is resolved.
+
+### 3.5 Next increments
+
 - Raise the bridge formal proof from smoke to bounded protocol properties
   (building on the `txn_table` proof already in place); consider binding the SVA
   module into the formal flow.

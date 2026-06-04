@@ -15,6 +15,10 @@ Tests (`test_bridge.py`):
   `RespErr=DERR` (clean ones `OK`) and that `crc_err_cnt` equals the corrupted
   count.
 
+Both randomized tests carry a functional-coverage model (`CoverGroup`) over
+opcode (`rd`/`wr`), completion class (`comp`/`compdata`), checksum
+(`good`/`bad`), and `RespErr` (`ok`/`derr`), and fail if any bin is never hit.
+
 ```bash
 make                 # Icarus (default)
 make SIM=verilator   # Verilator: also enables SVA (--assert) + coverage
