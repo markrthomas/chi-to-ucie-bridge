@@ -8,7 +8,20 @@ VERILATOR_INC  := $(VERILATOR_ROOT)/include
 VERILATOR_CPP  := $(VERILATOR_INC)/verilated.cpp $(VERILATOR_INC)/verilated_cov.cpp \
                   $(VERILATOR_INC)/verilated_threads.cpp
 
-BRIDGE_SRCS := $(shell grep -vE '^[[:space:]]*(#|$$)' src/files.f)
+# RTL source list (synthesizable bridge, in elaboration order).
+BRIDGE_SRCS := \
+	src/async_fifo.v \
+	src/cdc_sync.v \
+	src/reset_sync.v \
+	src/reset_drain.v \
+	src/credit_counter.v \
+	src/credit_pulse_sync.v \
+	src/txn_table.v \
+	src/chi_to_ucie_bridge.v
+
+# Bound concurrent SVA properties, enabled under Verilator's assertion engine.
+SVA_SRC  := src/chi_to_ucie_bridge_sva.sv
+SVA_ARGS := --assert +define+BRIDGE_SVA
 COV_DIR := sim/obj_dir_cov
 
 .PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage formal synth ci clean
@@ -24,7 +37,7 @@ help:
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
 	@echo "  make vlt-gtkwave - make vlt-vcd, then open the Verilator VCD"
 	@echo "  make regress   - lint + sim"
-	@echo "  make coverage  - Verilator coverage build + run -> sim/coverage.info"
+	@echo "  make coverage  - Verilator coverage + SVA (--assert) run -> sim/coverage.info"
 	@echo "  make formal    - SymbiYosys smoke targets"
 	@echo "  make synth     - Yosys synthesis smoke"
 	@echo "  make clean     - remove generated artifacts"
@@ -70,7 +83,7 @@ coverage:
 	@set -e; \
 	command -v $(VERILATOR) >/dev/null 2>&1 || { echo "[COVERAGE] verilator not on PATH; skipping"; exit 0; }; \
 	rm -rf $(COV_DIR); \
-	$(VERILATOR) --coverage -cc $(BRIDGE_SRCS) --top-module chi_to_ucie_bridge \
+	$(VERILATOR) --coverage $(SVA_ARGS) -cc $(BRIDGE_SRCS) $(SVA_SRC) --top-module chi_to_ucie_bridge \
 		--Mdir $(COV_DIR) -Isrc -Wno-DECLFILENAME -Wno-WIDTH -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-fatal; \
 	$(MAKE) -C $(COV_DIR) -f Vchi_to_ucie_bridge.mk; \
 	g++ -DVM_TRACE=0 -DVM_COVERAGE=1 -o $(COV_DIR)/sim_cov \

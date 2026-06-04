@@ -88,10 +88,46 @@ tag aliasing while outstanding and correct identity restoration.
 
 ## Phase 3 - Verification Expansion
 
-- Add cocotb scoreboard and randomized backpressure
-- Add interface SVA bindings for all valid/ready channels
-- Add functional coverage over opcode/status/checksum combinations
-- Raise formal checks from smoke to bounded protocol properties
+Goal: move beyond the directed smoke to assertion-based and coverage-driven
+verification, and stand up a cocotb stimulus environment.
+
+### 3.1 Toolchain enablement (done)
+
+- **SVA**: `src/chi_to_ucie_bridge_sva.sv` holds concurrent assertions + cover
+  points, attached by `bind`, guarded by `BRIDGE_SVA`. Active under Verilator
+  `--assert` (Icarus' concurrent-assertion support is too limited, so the file
+  is Verilator/formal-only).
+- **Coverage + SVA in one flow**: `make coverage` compiles the SVA module with
+  `--coverage --assert` and writes `sim/coverage.info` (line/toggle/user,
+  including the SVA cover points).
+- **cocotb**: `verification/cocotb/` runs under Icarus today (`make`). The
+  Verilator path (`make SIM=verilator`) is wired for `--assert --coverage` but
+  is blocked by a Verilator-5.047-devel / cocotb-1.8.1 value-change-callback
+  mismatch; see `verification/cocotb/README.md`.
+
+Current SVA properties: issued TX header/data checksums valid; TX header valid
+persists while the link stays open; write data never precedes its header.
+
+### 3.2 Next increments
+
+- cocotb scoreboard + randomized backpressure: far-side UCIe model that captures
+  the issued local tag and returns completions out of order after random
+  latency; scoreboard checks every CHI completion restores the original TxnID
+  and (for reads) the correct data. Randomize all valid/ready handshakes.
+- Extend SVA to the CHI-side handshakes and the RX completion channels.
+- Functional coverage over opcode/status/checksum combinations (Verilator user
+  coverage / cover properties).
+- Raise the bridge formal proof from smoke to bounded protocol properties
+  (building on the `txn_table` proof already in place).
+
+### Known issue (found via SVA review)
+
+While `ucie_tx_hdr_valid` is asserted and stalled (`!ready`), the local tag in
+the header can change if a completion frees a lower-indexed tag in the meantime,
+because `alloc_tag` tracks the lowest free slot combinationally. Functionally
+harmless (the tag is committed only at issue) but it violates strict
+valid/ready payload stability. Fix candidate: latch the presented tag while a
+header is pending. Tracked for Phase 2 refinement.
 
 ## Phase 4 - Protocol Refinement
 

@@ -3,6 +3,8 @@ sim/coverage.info
 sim/synth.log
 obj_dir*/
 verification/directed/build/
+verification/cocotb/sim_build/
+verification/cocotb/results.xml
 verification/formal/reset_drain/
 verification/formal/txn_table/
 verification/formal/chi_to_ucie_bridge/
@@ -13,3 +15,4 @@ verification/formal/chi_to_ucie_bridge/
 __pycache__/
 .pytest_cache/
 NOTES
+verification/cocotb/coverage.dat
