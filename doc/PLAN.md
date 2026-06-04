@@ -108,12 +108,17 @@ verification, and stand up a cocotb stimulus environment.
 Current SVA properties: issued TX header/data checksums valid; TX header valid
 persists while the link stays open; write data never precedes its header.
 
-### 3.2 Next increments
+### 3.2 cocotb scoreboard + randomized backpressure (done)
 
-- cocotb scoreboard + randomized backpressure: far-side UCIe model that captures
-  the issued local tag and returns completions out of order after random
-  latency; scoreboard checks every CHI completion restores the original TxnID
-  and (for reads) the correct data. Randomize all valid/ready handshakes.
+`verification/cocotb/test_bridge.py::test_random_traffic`: a far-side UCIe model
+captures each issued local tag and returns completions out of order, with
+randomized ready on every handshake. The scoreboard correlates CHI completions
+by the restored TxnID (the model never sees the original TxnID), checking read
+data, write-data payload, completion class, and exactly-once delivery
+(`tag_err_cnt`/`crc_err_cnt` stay zero). Runs under Icarus today.
+
+### 3.3 Next increments
+
 - Extend SVA to the CHI-side handshakes and the RX completion channels.
 - Functional coverage over opcode/status/checksum combinations (Verilator user
   coverage / cover properties).

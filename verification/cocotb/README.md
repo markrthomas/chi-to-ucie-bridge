@@ -2,6 +2,15 @@
 
 Python-driven tests for `chi_to_ucie_bridge`, runnable under Icarus or Verilator.
 
+Tests (`test_bridge.py`):
+- `test_read_translates` - directed connectivity smoke.
+- `test_random_traffic` - randomized read/write stream (80 transactions) with
+  backpressure on every handshake and out-of-order UCIe completions. A far-side
+  model returns completions keyed only by the bridge-local tag (it never sees
+  the CHI TxnID); the scoreboard correlates by the restored TxnID and checks
+  read data, write-data payload, completion class, and that nothing is dropped
+  or duplicated (`tag_err_cnt`/`crc_err_cnt` stay zero).
+
 ```bash
 make                 # Icarus (default)
 make SIM=verilator   # Verilator: also enables SVA (--assert) + coverage
