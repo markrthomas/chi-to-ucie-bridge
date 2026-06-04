@@ -17,7 +17,16 @@ module chi_to_ucie_bridge_sva (
   input wire                   tx_data_valid,
   input wire                   tx_data_ready,
   input wire [UCIE_DATA_W-1:0] tx_data,
-  input wire                   wq_empty
+  input wire                   wq_empty,
+  // CHI host clock domain (output completion channels)
+  input wire                   clk_chi,    // clk
+  input wire                   rst_chi,    // clk_rst_n
+  input wire                   chi_rsp_valid,
+  input wire                   chi_rsp_ready,
+  input wire [CHI_RSP_W-1:0]   chi_rsp_data,
+  input wire                   chi_comp_data_valid,
+  input wire                   chi_comp_data_ready,
+  input wire [CHI_DAT_W-1:0]   chi_comp_data
 );
 
 `ifdef BRIDGE_SVA
@@ -53,9 +62,30 @@ module chi_to_ucie_bridge_sva (
     tx_data_valid |-> !wq_empty
   );
 
+  // CHI completion output channels (CHI host clock domain): a presented
+  // completion holds valid and stable payload until the consumer accepts it.
+  a_rsp_persist: assert property (
+    @(posedge clk_chi) disable iff (!rst_chi)
+    (chi_rsp_valid && !chi_rsp_ready) |=> chi_rsp_valid
+  );
+  a_rsp_stable: assert property (
+    @(posedge clk_chi) disable iff (!rst_chi)
+    (chi_rsp_valid && !chi_rsp_ready) |=> $stable(chi_rsp_data)
+  );
+  a_comp_persist: assert property (
+    @(posedge clk_chi) disable iff (!rst_chi)
+    (chi_comp_data_valid && !chi_comp_data_ready) |=> chi_comp_data_valid
+  );
+  a_comp_stable: assert property (
+    @(posedge clk_chi) disable iff (!rst_chi)
+    (chi_comp_data_valid && !chi_comp_data_ready) |=> $stable(chi_comp_data)
+  );
+
   // Coverage: confirm the interesting events are actually exercised.
   c_hdr_issued:  cover property (tx_hdr_valid && tx_hdr_ready);
   c_data_issued: cover property (tx_data_valid && tx_data_ready);
+  c_rsp_accepted:  cover property (@(posedge clk_chi) chi_rsp_valid && chi_rsp_ready);
+  c_comp_accepted: cover property (@(posedge clk_chi) chi_comp_data_valid && chi_comp_data_ready);
 `endif
 
 endmodule
@@ -70,5 +100,13 @@ bind chi_to_ucie_bridge chi_to_ucie_bridge_sva u_sva (
   .tx_data_valid(ucie_tx_data_valid),
   .tx_data_ready(ucie_tx_data_ready),
   .tx_data(ucie_tx_data),
-  .wq_empty(wq_empty)
+  .wq_empty(wq_empty),
+  .clk_chi(clk),
+  .rst_chi(clk_rst_n),
+  .chi_rsp_valid(chi_rsp_valid),
+  .chi_rsp_ready(chi_rsp_ready),
+  .chi_rsp_data(chi_rsp_data),
+  .chi_comp_data_valid(chi_comp_data_valid),
+  .chi_comp_data_ready(chi_comp_data_ready),
+  .chi_comp_data(chi_comp_data)
 );

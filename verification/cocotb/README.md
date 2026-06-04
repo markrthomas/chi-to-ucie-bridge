@@ -10,6 +10,10 @@ Tests (`test_bridge.py`):
   the CHI TxnID); the scoreboard correlates by the restored TxnID and checks
   read data, write-data payload, completion class, and that nothing is dropped
   or duplicated (`tag_err_cnt`/`crc_err_cnt` stay zero).
+- `test_random_errors` - randomized read stream where the far side corrupts a
+  fraction of completion checksums; checks that each read still completes with
+  `RespErr=DERR` (clean ones `OK`) and that `crc_err_cnt` equals the corrupted
+  count.
 
 ```bash
 make                 # Icarus (default)

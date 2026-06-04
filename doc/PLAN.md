@@ -106,7 +106,9 @@ verification, and stand up a cocotb stimulus environment.
   mismatch; see `verification/cocotb/README.md`.
 
 Current SVA properties: issued TX header/data checksums valid; TX header valid
-persists while the link stays open; write data never precedes its header.
+persists and payload (incl. local tag) stays stable while stalled; write data
+never precedes its header; CHI completion outputs (RSP, CompData) hold valid and
+stable payload until the consumer accepts them.
 
 ### 3.2 cocotb scoreboard + randomized backpressure (done)
 
@@ -117,13 +119,23 @@ by the restored TxnID (the model never sees the original TxnID), checking read
 data, write-data payload, completion class, and exactly-once delivery
 (`tag_err_cnt`/`crc_err_cnt` stay zero). Runs under Icarus today.
 
-### 3.3 Next increments
+### 3.3 Randomized error injection (done)
 
-- Extend SVA to the CHI-side handshakes and the RX completion channels.
+`test_random_errors`: a randomized read stream where the far side corrupts a
+fraction of MEM_CPL header checksums. The scoreboard confirms every read still
+completes (tag freed), corrupted ones carry CHI `RespErr=DERR`, clean ones
+`OK`, and `crc_err_cnt` exactly equals the number of corrupted completions
+delivered (`tag_err_cnt` stays zero).
+
+### 3.4 Next increments
+
 - Functional coverage over opcode/status/checksum combinations (Verilator user
   coverage / cover properties).
 - Raise the bridge formal proof from smoke to bounded protocol properties
-  (building on the `txn_table` proof already in place).
+  (building on the `txn_table` proof already in place); consider binding the SVA
+  module into the formal flow.
+- Resolve the cocotb-on-Verilator callback issue (version pairing) so SVA +
+  coverage run under the randomized stimulus, not just `sim_main`.
 
 ### Resolved (found via SVA review)
 

@@ -27,10 +27,13 @@ CHI_REQ_WRITENOSNPFULL = 0x1D
 # ---- CHI DAT flit field map ----
 CHI_DAT_DATA_LSB = 0
 CHI_DAT_BE_LSB = 512
+CHI_DAT_RESPERR_LSB = 581
 CHI_DAT_TXNID_LSB = 586
 CHI_DAT_OPCODE_LSB = 594
 CHI_DAT_COMPDATA = 0x4
 CHI_DAT_NCBWRDATA = 0x3
+CHI_RESPERR_OK = 0x0
+CHI_RESPERR_DERR = 0x2
 
 # ---- CHI RSP flit field map ----
 CHI_RSP_TXNID_LSB = 6
@@ -104,6 +107,12 @@ def pack_ucie_hdr(kind, code, tag, addr16=0, length=0, src_id=0, attr=0):
 def pack_mem_cpl_data(tag, data):
     hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag, 0x0040, 0x40, 0x55, 0x00)
     return (hdr << UCIE_DATA_HDR_LSB) | ((data & MASK512) << 0)
+
+
+def pack_mem_cpl_data_badcrc(tag, data):
+    """A MEM_CPL packet whose embedded header checksum byte is corrupted."""
+    pkt = pack_mem_cpl_data(tag, data)
+    return pkt ^ (0xFF << UCIE_DATA_HDR_LSB)  # flip header[7:0] (the checksum)
 
 
 def data_for(addr16):
@@ -377,3 +386,128 @@ async def test_random_traffic(dut):
     assert int(dut.tag_err_cnt.value) == 0, f"tag_err_cnt={int(dut.tag_err_cnt.value)}"
     dut._log.info(f"random traffic OK: {sb.reads_done} reads, {sb.writes_done} writes, "
                   f"crc_err_cnt={int(dut.crc_err_cnt.value)}")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_random_errors(dut):
+    """Randomized read stream with corrupted-checksum completions.
+
+    The far side randomly returns MEM_CPL packets with a bad header checksum.
+    The bridge must still complete each read (freeing the tag) but flag RespErr,
+    and crc_err_cnt must equal the number of corrupted completions delivered.
+    """
+    random.seed(0x5EED5)
+    await reset_and_open(dut)
+
+    dut.ucie_tx_data_ready.value = 1
+    dut.ucie_rx_hdr_valid.value = 0
+    dut.chi_rsp_ready.value = 1
+
+    st = dict(running=True, n_corrupt=0, derr=0, ok=0, done=0, errors=[])
+    inuse = set()
+    expected = {}                 # txnid -> expected data
+    pend = []                     # (tag, data, corrupt)
+
+    N = 80
+    MAX_INFLIGHT = 12
+
+    def rdy():
+        return 1 if random.random() < 0.7 else 0
+
+    async def tx_hdr_consumer():
+        while st["running"]:
+            dut.ucie_tx_hdr_ready.value = rdy()
+            await ReadOnly()
+            if dut.ucie_tx_hdr_ready.value == 1 and dut.ucie_tx_hdr_valid.value == 1:
+                hdr = int(dut.ucie_tx_hdr.value)
+                tag = field(hdr, UCIE_TAG_LSB, 8)
+                addr16 = field(hdr, UCIE_ADDR_LSB, 16)
+                corrupt = random.random() < 0.3
+                if corrupt:
+                    st["n_corrupt"] += 1
+                pend.append((tag, data_for(addr16), corrupt))
+            await RisingEdge(dut.ucie_clk)
+
+    async def rx_data_driver():
+        while st["running"]:
+            chosen = None
+            if pend and random.random() < 0.6:
+                chosen = random.choice(pend)
+                tag, data, corrupt = chosen
+                pkt = pack_mem_cpl_data_badcrc(tag, data) if corrupt \
+                    else pack_mem_cpl_data(tag, data)
+                dut.ucie_rx_data.value = pkt
+                dut.ucie_rx_data_valid.value = 1
+            else:
+                dut.ucie_rx_data_valid.value = 0
+            await ReadOnly()
+            took = chosen is not None and dut.ucie_rx_data_ready.value == 1
+            await RisingEdge(dut.ucie_clk)
+            if took:
+                pend.remove(chosen)
+
+    async def chi_comp_sink():
+        while st["running"]:
+            dut.chi_comp_data_ready.value = rdy()
+            await ReadOnly()
+            if dut.chi_comp_data_ready.value == 1 and dut.chi_comp_data_valid.value == 1:
+                dat = int(dut.chi_comp_data.value)
+                txnid = field(dat, CHI_DAT_TXNID_LSB, 8)
+                data = (dat >> CHI_DAT_DATA_LSB) & MASK512
+                resperr = field(dat, CHI_DAT_RESPERR_LSB, 2)
+                exp = expected.pop(txnid, None)
+                if exp is None:
+                    st["errors"].append(f"CompData for unknown TxnID 0x{txnid:02x}")
+                elif data != exp:
+                    st["errors"].append(f"read data mismatch TxnID 0x{txnid:02x}")
+                if resperr == CHI_RESPERR_DERR:
+                    st["derr"] += 1
+                elif resperr == CHI_RESPERR_OK:
+                    st["ok"] += 1
+                else:
+                    st["errors"].append(f"unexpected RespErr {resperr}")
+                st["done"] += 1
+                inuse.discard(txnid)
+            await RisingEdge(dut.clk)
+
+    for c in (tx_hdr_consumer, rx_data_driver, chi_comp_sink):
+        cocotb.start_soon(c())
+
+    addr_ctr = 0
+    for i in range(N):
+        while len(inuse) >= MAX_INFLIGHT:
+            await RisingEdge(dut.clk)
+        for _ in range(random.randint(0, 3)):
+            await RisingEdge(dut.clk)
+        txnid = random.randint(0, 255)
+        while txnid in inuse:
+            txnid = random.randint(0, 255)
+        addr_ctr = (addr_ctr + 1) & 0xFFFF
+        inuse.add(txnid)
+        expected[txnid] = data_for(addr_ctr & 0xFFFF)
+        dut.chi_req_data.value = make_chi_read(txnid, addr_ctr)
+        dut.chi_req_valid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                break
+        dut.chi_req_valid.value = 0
+
+    for _ in range(4000):
+        await RisingEdge(dut.clk)
+        if not inuse and not pend:
+            break
+
+    st["running"] = False
+    await ClockCycles(dut.clk, 5)
+
+    crc = int(dut.crc_err_cnt.value)
+    assert not st["errors"], "errors:\n" + "\n".join(st["errors"][:10])
+    assert st["done"] == N, f"completed {st['done']}/{N}"
+    assert st["derr"] == st["n_corrupt"], \
+        f"DERR completions {st['derr']} != corrupted {st['n_corrupt']}"
+    assert st["ok"] == N - st["n_corrupt"], f"OK completions {st['ok']}"
+    assert crc == st["n_corrupt"], f"crc_err_cnt {crc} != corrupted {st['n_corrupt']}"
+    assert int(dut.tag_err_cnt.value) == 0, f"tag_err_cnt={int(dut.tag_err_cnt.value)}"
+    dut._log.info(f"random errors OK: {N} reads, {st['n_corrupt']} corrupted -> "
+                  f"{st['derr']} DERR, crc_err_cnt={crc}")
