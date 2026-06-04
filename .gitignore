@@ -4,6 +4,7 @@ sim/synth.log
 obj_dir*/
 verification/directed/build/
 verification/formal/reset_drain/
+verification/formal/txn_table/
 verification/formal/chi_to_ucie_bridge/
 *.vcd
 *.fst

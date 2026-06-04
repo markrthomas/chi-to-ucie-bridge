@@ -1,14 +1,18 @@
 // CHI <-> UCIe bridge.
 //
-// Phase 1 baseline: dual-clock async FIFOs, compact UCIe adapter packet model,
-// link readiness gating, and directed-testable CHI read/write/completion paths.
+// Phase 2: outstanding transaction tracking. Requests are issued to UCIe with a
+// bridge-local tag (allocated from txn_table) rather than the CHI TxnID; the
+// original CHI identity is restored from the table when the completion returns.
+// Retains the Phase 1 dual-clock async FIFOs, compact UCIe adapter packet model,
+// and link readiness gating.
 
 `include "chi_ucie_bridge_defs.vh"
 
 module chi_to_ucie_bridge #(
-  parameter integer FIFO_DEPTH     = 8,
-  parameter integer POSTED_CREDITS = 8,
-  parameter integer NP_CREDITS     = 8
+  parameter integer FIFO_DEPTH      = 8,
+  parameter integer POSTED_CREDITS  = 8,
+  parameter integer NP_CREDITS      = 8,
+  parameter integer MAX_OUTSTANDING = 32
 ) (
   input  wire                     clk,
   input  wire                     ucie_clk,
@@ -50,8 +54,12 @@ module chi_to_ucie_bridge #(
   input  wire                     err_inj_en,
   output wire                     drain_done,
   output reg  [15:0]              crc_err_cnt,
+  output reg  [15:0]              tag_err_cnt,
   output reg  [15:0]              drain_cnt
 );
+
+  localparam integer LTAG_W = $clog2(MAX_OUTSTANDING);
+  localparam integer WQ_AW  = $clog2(MAX_OUTSTANDING);
 
   wire clk_rst_n;
   wire ucie_rst_n;
@@ -83,6 +91,10 @@ module chi_to_ucie_bridge #(
   wire [CHI_RSP_W-1:0] rsp_r_data;
   wire [CHI_DAT_W-1:0] rdat_r_data;
 
+  // UCIe TX accept pulses (declared early; used in the FIFO read enables below).
+  wire hdr_fire;
+  wire data_fire;
+
   wire req_r_empty_clk;
   wire wdat_r_empty_clk;
   cdc_sync #(.STAGES(2)) u_req_empty_cdc (
@@ -108,6 +120,9 @@ module chi_to_ucie_bridge #(
     .clk(ucie_clk), .rst_n(ucie_rst_n), .d(bridge_open), .q(bridge_open_ucie)
   );
 
+  // ---------------------------------------------------------------------------
+  // CHI host-domain enqueue
+  // ---------------------------------------------------------------------------
   wire chi_req_is_write = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_read  = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire accept_wr_data   = chi_req_is_write && chi_wr_data_valid && !wdat_w_full;
@@ -127,18 +142,89 @@ module chi_to_ucie_bridge #(
 
   async_fifo #(.WIDTH(CHI_REQ_W), .DEPTH(FIFO_DEPTH)) u_req_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(req_w_en), .w_data(chi_req_data), .w_full(req_w_full),
-    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(ucie_tx_hdr_valid && ucie_tx_hdr_ready),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(hdr_fire),
     .r_data(req_r_data), .r_empty(req_r_empty)
   );
 
   async_fifo #(.WIDTH(TXNID_W+CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_wdat_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(wdat_w_en), .w_data(wdat_w_data), .w_full(wdat_w_full),
-    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(ucie_tx_data_valid && ucie_tx_data_ready),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire),
     .r_data(wdat_r_data), .r_empty(wdat_r_empty)
   );
 
+  // ---------------------------------------------------------------------------
+  // Transaction table (ucie_clk domain)
+  // ---------------------------------------------------------------------------
+  wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire [LTAG_W-1:0]   alloc_tag;
+  wire                tbl_full;
+  wire                tbl_tag_err;
+
+  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
+  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
+  wire [LTAG_W-1:0] rx_hdr_tag = ucie_rx_hdr[UCIE_TAG_LSB +: LTAG_W];
+  wire [LTAG_W-1:0] rx_dat_tag = ucie_rx_data[UCIE_DATA_HDR_LSB + UCIE_TAG_LSB +: LTAG_W];
+
+  wire [TXNID_W-1:0] a_txnid;
+  wire [NODEID_W-1:0] a_srcid;
+  wire                a_is_write;
+  wire                a_valid;
+  wire [TXNID_W-1:0] b_txnid;
+  wire [NODEID_W-1:0] b_srcid;
+  wire                b_is_write;
+  wire                b_valid;
+  wire [LTAG_W:0]    outstanding;
+
+  txn_table #(
+    .N(MAX_OUTSTANDING), .TID_W(TXNID_W), .SID_W(NODEID_W), .LTAG_W(LTAG_W)
+  ) u_txn_table (
+    .clk(ucie_clk), .rst_n(ucie_rst_n),
+    .alloc_en(hdr_fire),
+    .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
+    .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
+    .alloc_is_write(req_head_is_write),
+    .alloc_tag(alloc_tag),
+    .full(tbl_full),
+    .a_lookup_tag(rx_hdr_tag), .a_free_en(rx_hdr_fire),
+    .a_txnid(a_txnid), .a_srcid(a_srcid), .a_is_write(a_is_write), .a_valid(a_valid),
+    .b_lookup_tag(rx_dat_tag), .b_free_en(rx_dat_fire),
+    .b_txnid(b_txnid), .b_srcid(b_srcid), .b_is_write(b_is_write), .b_valid(b_valid),
+    .outstanding(outstanding), .tag_err(tbl_tag_err)
+  );
+
+  // ---------------------------------------------------------------------------
+  // Write-data tag side-queue: carries each write's local tag from header issue
+  // to data issue and enforces header-before-data ordering on the independent
+  // ready paths.
+  // ---------------------------------------------------------------------------
+  reg [LTAG_W-1:0] wtag_mem [0:MAX_OUTSTANDING-1];
+  reg [WQ_AW:0]    wq_wptr;
+  reg [WQ_AW:0]    wq_rptr;
+  wire wq_empty = (wq_wptr == wq_rptr);
+  wire [LTAG_W-1:0] wq_front = wtag_mem[wq_rptr[WQ_AW-1:0]];
+
+  wire wq_push = hdr_fire && req_head_is_write;
+  wire wq_pop  = data_fire;
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n) begin
+      wq_wptr <= {(WQ_AW+1){1'b0}};
+      wq_rptr <= {(WQ_AW+1){1'b0}};
+    end else begin
+      if (wq_push) begin
+        wtag_mem[wq_wptr[WQ_AW-1:0]] <= alloc_tag;
+        wq_wptr <= wq_wptr + 1'b1;
+      end
+      if (wq_pop) wq_rptr <= wq_rptr + 1'b1;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // CHI -> UCIe translation (TX)
+  // ---------------------------------------------------------------------------
   function automatic [UCIE_HDR_W-1:0] translate_chi_req_to_ucie;
     input [CHI_REQ_W-1:0] chi_req;
+    input [7:0]           local_tag;
     reg [3:0] msg;
     reg [7:0] attr;
     begin
@@ -150,7 +236,7 @@ module chi_to_ucie_bridge #(
       translate_chi_req_to_ucie = pack_ucie_hdr(
         UCIE_PKT_KIND_AD_REQ,
         msg,
-        chi_req[CHI_REQ_TXNID_LSB +: TXNID_W],
+        local_tag,
         chi_req[CHI_REQ_ADDR_LSB +: 16],
         {5'b0, chi_req[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W]},
         {1'b0, chi_req[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]},
@@ -161,6 +247,7 @@ module chi_to_ucie_bridge #(
 
   function automatic [UCIE_DATA_W-1:0] translate_chi_data_to_ucie;
     input [TXNID_W+CHI_DAT_W-1:0] item;
+    input [7:0]                   local_tag;
     reg [CHI_DAT_W-1:0] dat;
     reg [UCIE_HDR_W-1:0] hdr;
     begin
@@ -168,7 +255,7 @@ module chi_to_ucie_bridge #(
       hdr = pack_ucie_hdr(
         UCIE_PKT_KIND_AD_REQ,
         UCIE_MSG_MEM_WR_DATA,
-        item[CHI_DAT_W +: TXNID_W],
+        local_tag,
         16'h0000,
         8'h40,
         8'h00,
@@ -182,38 +269,48 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
-  assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty;
-  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data);
+  assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full;
+  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, alloc_tag});
+  assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
-  assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty;
-  assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data);
+  assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty;
+  assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front});
+  assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 
+  // ---------------------------------------------------------------------------
+  // UCIe -> CHI translation (RX); CHI identity restored from the table
+  // ---------------------------------------------------------------------------
   function automatic [CHI_RSP_W-1:0] translate_ucie_hdr_to_chi_rsp;
     input [UCIE_HDR_W-1:0] hdr;
+    input [TXNID_W-1:0]    r_txnid;
+    input [NODEID_W-1:0]   r_srcid;
+    input                  r_valid;
     reg [CHI_RSP_W-1:0] rsp;
     reg ok;
     begin
-      ok = ucie_hdr_checksum_ok(hdr) &&
+      ok = ucie_hdr_checksum_ok(hdr) && r_valid &&
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_AD_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       rsp = {CHI_RSP_W{1'b0}};
       rsp[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] = ok ? CHI_RESPERR_OK : CHI_RESPERR_NDERR;
-      rsp[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W]       = hdr[UCIE_TAG_LSB +: CHI_RSP_DBID_W];
-      rsp[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]     = hdr[UCIE_TAG_LSB +: TXNID_W];
+      rsp[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W]       = r_txnid[CHI_RSP_DBID_W-1:0];
+      rsp[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]     = r_txnid;
       rsp[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W]   = CHI_RSP_COMP;
-      rsp[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W]     = hdr[UCIE_ID_LSB +: CHI_RSP_SRCID_W];
+      rsp[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W]     = r_srcid;
       translate_ucie_hdr_to_chi_rsp = rsp;
     end
   endfunction
 
   function automatic [CHI_DAT_W-1:0] translate_ucie_data_to_chi;
     input [UCIE_DATA_W-1:0] pkt;
+    input [TXNID_W-1:0]     r_txnid;
+    input                   r_valid;
     reg [UCIE_HDR_W-1:0] hdr;
     reg [CHI_DAT_W-1:0] dat;
     reg ok;
     begin
       hdr = pkt[UCIE_DATA_HDR_LSB +: UCIE_HDR_W];
-      ok = ucie_hdr_checksum_ok(hdr) &&
+      ok = ucie_hdr_checksum_ok(hdr) && r_valid &&
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_MEM_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       dat = {CHI_DAT_W{1'b0}};
@@ -223,7 +320,7 @@ module chi_to_ucie_bridge #(
       dat[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W]   = 4'h0;
       dat[CHI_DAT_RESPERR_LSB +: CHI_DAT_RESPERR_W] = ok ? CHI_RESPERR_OK : CHI_RESPERR_DERR;
       dat[CHI_DAT_RESP_LSB +: CHI_DAT_RESP_W]       = CHI_CACHE_I;
-      dat[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W]     = hdr[UCIE_TAG_LSB +: TXNID_W];
+      dat[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W]     = r_txnid;
       dat[CHI_DAT_OPCODE_LSB +: CHI_DAT_OPCODE_W]   = CHI_DAT_COMPDATA;
       translate_ucie_data_to_chi = dat;
     end
@@ -232,21 +329,19 @@ module chi_to_ucie_bridge #(
   assign ucie_rx_hdr_ready = bridge_open_ucie && !rsp_w_full;
   assign ucie_rx_data_ready = bridge_open_ucie && !rdat_w_full;
 
-  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
-  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
   wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_checksum_ok(ucie_rx_hdr);
   wire rx_dat_bad = rx_dat_fire && !ucie_hdr_checksum_ok(ucie_rx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]);
 
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
-    .w_data(translate_ucie_hdr_to_chi_rsp(ucie_rx_hdr)), .w_full(rsp_w_full),
+    .w_data(translate_ucie_hdr_to_chi_rsp(ucie_rx_hdr, a_txnid, a_srcid, a_valid)), .w_full(rsp_w_full),
     .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_rsp_valid && chi_rsp_ready),
     .r_data(rsp_r_data), .r_empty(rsp_r_empty)
   );
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_rdat_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_dat_fire),
-    .w_data(translate_ucie_data_to_chi(ucie_rx_data)), .w_full(rdat_w_full),
+    .w_data(translate_ucie_data_to_chi(ucie_rx_data, b_txnid, b_valid)), .w_full(rdat_w_full),
     .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_comp_data_valid && chi_comp_data_ready),
     .r_data(rdat_r_data), .r_empty(rdat_r_empty)
   );
@@ -256,11 +351,22 @@ module chi_to_ucie_bridge #(
   assign chi_comp_data_valid = !rdat_r_empty;
   assign chi_comp_data = rdat_r_data;
 
+  // ---------------------------------------------------------------------------
+  // Error / status counters
+  // ---------------------------------------------------------------------------
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n) begin
       crc_err_cnt <= 16'h0000;
     end else if (err_inj_en || rx_hdr_bad || rx_dat_bad) begin
       crc_err_cnt <= crc_err_cnt + 16'h0001;
+    end
+  end
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n) begin
+      tag_err_cnt <= 16'h0000;
+    end else if (tbl_tag_err) begin
+      tag_err_cnt <= tag_err_cnt + 16'h0001;
     end
   end
 

@@ -1,0 +1,15 @@
+[options]
+mode bmc
+depth 16
+
+[engines]
+smtbmc
+
+[script]
+read_verilog -formal -sv txn_table.v
+# Small table so the BMC horizon actually reaches the full/alloc-blocked bound.
+chparam -set N 4 -set LTAG_W 2 txn_table
+prep -top txn_table
+
+[files]
+../../src/txn_table.v

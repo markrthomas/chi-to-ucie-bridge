@@ -29,9 +29,25 @@ the UCIe domain.
 |:---|:---|
 | `AD_CPL / SC` | `RSP / Comp` |
 | `MEM_CPL / SC` with data payload | `DAT / CompData` |
-| bad checksum or unsupported completion | CHI response/data with `RespErr` set |
+| bad checksum, unsupported completion, or unknown tag | CHI response/data with `RespErr` set |
 
-The CHI `TxnID` is carried directly as the UCIe tag in Phase 1.
+## Transaction tracking
+
+Each request issued to UCIe is assigned a bridge-local tag from `txn_table`
+(`MAX_OUTSTANDING` entries, `ucie_clk` domain) instead of forwarding the CHI
+`TxnID`. The table records `{TxnID, SrcID, is_write}` keyed by the local tag.
+When a completion returns, the local tag in the UCIe header is looked up to
+restore the original CHI identity, and the entry is freed. The table presents:
+
+- one allocate port (header issue) with `full` back-pressuring `ucie_tx_hdr`;
+- two free/lookup ports, because the `AD_CPL` header and `MEM_CPL` data channels
+  can each retire a transaction in the same cycle.
+
+A write's local tag is carried from header issue to data issue by an in-order
+side-queue, which also prevents the `MEM_WR_DATA` packet from being issued ahead
+of its request header on the independent ready paths. A completion to a tag that
+is not currently allocated does not free anything, sets CHI `RespErr`, and pulses
+the `tag_err_cnt` counter.
 
 ## FIFOs
 
@@ -44,6 +60,10 @@ The CHI `TxnID` is carried directly as the UCIe tag in Phase 1.
 
 ## Verification
 
-The directed testbench is self-checking and runs under Icarus. Verilator lint is
-the fast structural gate. Formal files are present as smoke scaffolding for the
-shared FSM and bridge top.
+The directed testbench is self-checking and runs under Icarus, including
+Phase 2 checks that the bridge issues distinct local tags (even for reused CHI
+`TxnID`s), tags the write-data packet correctly, and restores the original CHI
+`TxnID` on completion. Verilator lint is the fast structural gate. Formal
+covers the `reset_drain` FSM and the bridge top as smoke, plus bounded
+`txn_table` properties (allocation only targets free slots; the outstanding
+count stays within the table size).

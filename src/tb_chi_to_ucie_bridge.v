@@ -46,7 +46,14 @@ module tb_chi_to_ucie_bridge;
   reg         err_inj_en;
   wire        drain_done;
   wire [15:0] crc_err_cnt;
+  wire [15:0] tag_err_cnt;
   wire [15:0] drain_cnt;
+
+  // Local tags the bridge assigns at UCIe header issue (captured by the tb).
+  reg [7:0] rd_tag;
+  reg [7:0] wr_tag;
+  reg [7:0] tag_a;
+  reg [7:0] tag_b;
 
   chi_to_ucie_bridge #(
     .FIFO_DEPTH(FIFO_DEPTH)
@@ -82,6 +89,7 @@ module tb_chi_to_ucie_bridge;
     .err_inj_en(err_inj_en),
     .drain_done(drain_done),
     .crc_err_cnt(crc_err_cnt),
+    .tag_err_cnt(tag_err_cnt),
     .drain_cnt(drain_cnt)
   );
 
@@ -199,12 +207,12 @@ module tb_chi_to_ucie_bridge;
     if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== UCIE_MSG_MEM_RD) begin
       $display("FAIL: expected UCIe MEM_RD"); $finish(1);
     end
-    if (ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB] !== 8'h3c) begin
-      $display("FAIL: read tag mismatch"); $finish(1);
-    end
     if (ucie_tx_hdr[UCIE_ADDR_MSB:UCIE_ADDR_LSB] !== 16'h1234) begin
       $display("FAIL: read address low16 mismatch"); $finish(1);
     end
+    // Phase 2: the bridge issues a bridge-local tag, not the CHI TxnID. Capture
+    // it so the completion can be replayed against the same tag.
+    rd_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
     @(posedge ucie_clk);
 
     $display("INFO: CHI write -> UCIe AD_REQ + DATA smoke");
@@ -215,9 +223,17 @@ module tb_chi_to_ucie_bridge;
     if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== UCIE_MSG_MEM_WR) begin
       $display("FAIL: expected UCIe MEM_WR"); $finish(1);
     end
+    wr_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+    if (wr_tag === rd_tag) begin
+      $display("FAIL: write reused the outstanding read's local tag"); $finish(1);
+    end
     wait (ucie_tx_data_valid);
     if (ucie_tx_data[UCIE_DATA_HDR_LSB + UCIE_CODE_LSB +: 4] !== UCIE_MSG_MEM_WR_DATA) begin
       $display("FAIL: expected UCIe write data packet"); $finish(1);
+    end
+    // Write-data packet must carry its request's local tag.
+    if (ucie_tx_data[UCIE_DATA_HDR_LSB + UCIE_TAG_LSB +: 8] !== wr_tag) begin
+      $display("FAIL: write data tag != request local tag"); $finish(1);
     end
     if (ucie_tx_data[UCIE_DATA_PAYLOAD_LSB +: 512] !==
         512'h12345678_9ABCDEF0_FEDCBA98_76543210_11223344_55667788_99AABBCC_DDEEFF00) begin
@@ -225,10 +241,10 @@ module tb_chi_to_ucie_bridge;
     end
     @(posedge ucie_clk);
 
-    $display("INFO: UCIe AD_CPL -> CHI RSP smoke");
+    $display("INFO: UCIe AD_CPL -> CHI RSP smoke (TxnID restored from table)");
     chi_rsp_ready = 1'b1;
     @(posedge ucie_clk);
-    ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, 8'hd2, 16'h0000, 8'h00, 8'h55, 8'h00);
+    ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, wr_tag, 16'h0000, 8'h00, 8'h55, 8'h00);
     ucie_rx_hdr_valid = 1'b1;
     while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
     @(posedge ucie_clk);
@@ -238,14 +254,14 @@ module tb_chi_to_ucie_bridge;
       $display("FAIL: expected CHI Comp"); $finish(1);
     end
     if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hd2) begin
-      $display("FAIL: CHI response TxnID mismatch"); $finish(1);
+      $display("FAIL: CHI response TxnID not restored to 0xd2"); $finish(1);
     end
     @(posedge clk);
 
-    $display("INFO: UCIe MEM_CPL data -> CHI CompData smoke");
+    $display("INFO: UCIe MEM_CPL data -> CHI CompData smoke (TxnID restored from table)");
     chi_comp_data_ready = 1'b1;
     @(posedge ucie_clk);
-    ucie_rx_data = pack_rx_data(8'h3c, 512'hFEEDFACE_CAFEBABE_DEADC0DE_00000001);
+    ucie_rx_data = pack_rx_data(rd_tag, 512'hFEEDFACE_CAFEBABE_DEADC0DE_00000001);
     ucie_rx_data_valid = 1'b1;
     while (!ucie_rx_data_ready) @(posedge ucie_clk);
     @(posedge ucie_clk);
@@ -255,10 +271,50 @@ module tb_chi_to_ucie_bridge;
       $display("FAIL: expected CHI CompData"); $finish(1);
     end
     if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'h3c) begin
-      $display("FAIL: CHI data TxnID mismatch"); $finish(1);
+      $display("FAIL: CHI data TxnID not restored to 0x3c"); $finish(1);
     end
     if (chi_comp_data[CHI_DAT_DATA_LSB +: 64] !== 64'hDEADC0DE_00000001) begin
       $display("FAIL: CHI data payload mismatch"); $finish(1);
+    end
+    @(posedge clk);
+
+    $display("INFO: two reads reusing CHI TxnID -> distinct local tags");
+    // Issue two reads with the same CHI TxnID while both stay outstanding.
+    send_chi_read(8'h77, 48'h0000_0000_AA00);
+    wait (ucie_tx_hdr_valid);
+    tag_a = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+    @(posedge ucie_clk);
+    send_chi_read(8'h77, 48'h0000_0000_BB00);
+    wait (ucie_tx_hdr_valid);
+    tag_b = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+    @(posedge ucie_clk);
+    if (tag_a === tag_b) begin
+      $display("FAIL: duplicate CHI TxnID got the same local tag"); $finish(1);
+    end
+    // Complete both and confirm each restores TxnID 0x77.
+    ucie_rx_data = pack_rx_data(tag_a, 512'h0000_0000_0000_00A0);
+    ucie_rx_data_valid = 1'b1;
+    while (!ucie_rx_data_ready) @(posedge ucie_clk);
+    @(posedge ucie_clk);
+    ucie_rx_data_valid = 1'b0;
+    wait (chi_comp_data_valid);
+    if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'h77) begin
+      $display("FAIL: first reused-TxnID completion not restored to 0x77"); $finish(1);
+    end
+    @(posedge clk);
+    ucie_rx_data = pack_rx_data(tag_b, 512'h0000_0000_0000_00B0);
+    ucie_rx_data_valid = 1'b1;
+    while (!ucie_rx_data_ready) @(posedge ucie_clk);
+    @(posedge ucie_clk);
+    ucie_rx_data_valid = 1'b0;
+    wait (chi_comp_data_valid && (chi_comp_data[CHI_DAT_DATA_LSB +: 8] === 8'hB0));
+    if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'h77) begin
+      $display("FAIL: second reused-TxnID completion not restored to 0x77"); $finish(1);
+    end
+    @(posedge clk);
+
+    if (tag_err_cnt !== 16'h0000) begin
+      $display("FAIL: unexpected tag_err_cnt=%0d", tag_err_cnt); $finish(1);
     end
 
     $display("PASS CHI-to-UCIe bridge directed smoke");

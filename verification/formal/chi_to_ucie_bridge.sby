@@ -6,7 +6,7 @@ depth 4
 smtbmc
 
 [script]
-read_verilog -formal -sv -I. async_fifo.v cdc_sync.v reset_sync.v reset_drain.v credit_counter.v credit_pulse_sync.v chi_to_ucie_bridge.v
+read_verilog -formal -sv -I. async_fifo.v cdc_sync.v reset_sync.v reset_drain.v credit_counter.v credit_pulse_sync.v txn_table.v chi_to_ucie_bridge.v
 prep -top chi_to_ucie_bridge
 
 [files]
@@ -16,5 +16,6 @@ prep -top chi_to_ucie_bridge
 ../../src/reset_drain.v
 ../../src/credit_counter.v
 ../../src/credit_pulse_sync.v
+../../src/txn_table.v
 ../../src/chi_ucie_bridge_defs.vh
 ../../src/chi_to_ucie_bridge.v

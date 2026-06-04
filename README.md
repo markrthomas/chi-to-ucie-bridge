@@ -33,6 +33,7 @@ graph LR
 | `src/cdc_sync.v` | Multi-flop single-bit synchronizer. |
 | `src/reset_sync.v` | Async-assert / sync-deassert reset synchronizer. |
 | `src/reset_drain.v` | Link-up/down bridge-open FSM. |
+| `src/txn_table.v` | Outstanding-transaction table: local tag allocation and CHI identity restore. |
 | `src/tb_chi_to_ucie_bridge.v` | Self-checking directed smoke test. |
 
 ## Quick Start
