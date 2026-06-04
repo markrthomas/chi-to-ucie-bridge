@@ -87,7 +87,7 @@ module chi_to_ucie_bridge #(
   wire rdat_r_empty;
 
   wire [CHI_REQ_W-1:0] req_r_data;
-  wire [TXNID_W+CHI_DAT_W-1:0] wdat_r_data;
+  wire [CHI_DAT_W-1:0] wdat_r_data;
   wire [CHI_RSP_W-1:0] rsp_r_data;
   wire [CHI_DAT_W-1:0] rdat_r_data;
 
@@ -136,9 +136,8 @@ module chi_to_ucie_bridge #(
 
   wire req_w_en = chi_req_valid && chi_req_ready;
   wire wdat_w_en = req_w_en && chi_req_is_write;
-  wire [TXNID_W+CHI_DAT_W-1:0] wdat_w_data = {
-    chi_req_data[CHI_REQ_TXNID_LSB +: TXNID_W], chi_wr_data
-  };
+  // The write's UCIe tag comes from the side-queue at data issue, so the data
+  // FIFO carries only the payload.
 
   async_fifo #(.WIDTH(CHI_REQ_W), .DEPTH(FIFO_DEPTH)) u_req_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(req_w_en), .w_data(chi_req_data), .w_full(req_w_full),
@@ -146,8 +145,8 @@ module chi_to_ucie_bridge #(
     .r_data(req_r_data), .r_empty(req_r_empty)
   );
 
-  async_fifo #(.WIDTH(TXNID_W+CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_wdat_fifo (
-    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(wdat_w_en), .w_data(wdat_w_data), .w_full(wdat_w_full),
+  async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_wdat_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(wdat_w_en), .w_data(chi_wr_data), .w_full(wdat_w_full),
     .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire),
     .r_data(wdat_r_data), .r_empty(wdat_r_empty)
   );
@@ -246,12 +245,10 @@ module chi_to_ucie_bridge #(
   endfunction
 
   function automatic [UCIE_DATA_W-1:0] translate_chi_data_to_ucie;
-    input [TXNID_W+CHI_DAT_W-1:0] item;
-    input [7:0]                   local_tag;
-    reg [CHI_DAT_W-1:0] dat;
+    input [CHI_DAT_W-1:0] dat;
+    input [7:0]           local_tag;
     reg [UCIE_HDR_W-1:0] hdr;
     begin
-      dat = item[CHI_DAT_W-1:0];
       hdr = pack_ucie_hdr(
         UCIE_PKT_KIND_AD_REQ,
         UCIE_MSG_MEM_WR_DATA,
