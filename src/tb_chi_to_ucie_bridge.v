@@ -181,12 +181,13 @@ module tb_chi_to_ucie_bridge;
   initial begin
     clk = 1'b0;
     ucie_clk = 1'b0;
-    reset_tb();
 
     if ($test$plusargs("vcd")) begin
       $dumpfile("build/waves.vcd");
       $dumpvars(0, tb_chi_to_ucie_bridge);
     end
+
+    reset_tb();
 
     $display("INFO: CHI read -> UCIe AD_REQ smoke");
     ucie_tx_hdr_ready = 1'b1;

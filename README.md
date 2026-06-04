@@ -41,6 +41,8 @@ graph LR
 make regress   # Verilator lint + Icarus directed simulation
 make sim       # directed testbench only
 make vcd       # directed testbench with waveform
+make vlt-vcd   # Verilator trace harness waveform
+make coverage  # Verilator coverage run -> sim/coverage.info
 make synth     # Yosys synthesis smoke if yosys is installed
 make formal    # SymbiYosys smoke targets if sby is installed
 make clean

@@ -1,4 +1,6 @@
-sim/
+sim/obj_dir*/
+sim/coverage.info
+sim/synth.log
 obj_dir*/
 verification/directed/build/
 verification/formal/reset_drain/
@@ -9,3 +11,4 @@ verification/formal/chi_to_ucie_bridge/
 *.jou
 __pycache__/
 .pytest_cache/
+NOTES
