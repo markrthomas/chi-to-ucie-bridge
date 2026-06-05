@@ -265,11 +265,26 @@ module chi_to_ucie_bridge #(
   end
 
   // ---------------------------------------------------------------------------
+  // Flit sequence counter (ucie_clk domain): increments per issued TX packet.
+  // Used by both hdr and data translation functions for sequencing in §4.3.
+  // ---------------------------------------------------------------------------
+  reg [7:0] flit_seq_ctr;
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n)
+      flit_seq_ctr <= 8'h00;
+    else
+      flit_seq_ctr <= flit_seq_ctr + {7'h0, hdr_fire} + {7'h0, data_fire};
+  end
+  // When header and data fire simultaneously, data gets the next sequence number.
+  wire [7:0] dat_flit_seq = flit_seq_ctr + {7'h0, hdr_fire};
+
+  // ---------------------------------------------------------------------------
   // CHI -> UCIe translation (TX)
   // ---------------------------------------------------------------------------
   function automatic [UCIE_HDR_W-1:0] translate_chi_req_to_ucie;
     input [CHI_REQ_W-1:0] chi_req;
     input [7:0]           local_tag;
+    input [7:0]           flit_seq;
     reg [3:0] msg;
     reg [7:0] attr;
     begin
@@ -282,10 +297,11 @@ module chi_to_ucie_bridge #(
         UCIE_PKT_KIND_AD_REQ,
         msg,
         local_tag,
-        chi_req[CHI_REQ_ADDR_LSB +: 16],
+        chi_req[CHI_REQ_ADDR_LSB +: 48],
         {5'b0, chi_req[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W]},
         {1'b0, chi_req[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]},
-        attr
+        attr,
+        flit_seq
       );
     end
   endfunction
@@ -293,16 +309,18 @@ module chi_to_ucie_bridge #(
   function automatic [UCIE_DATA_W-1:0] translate_chi_data_to_ucie;
     input [CHI_DAT_W-1:0] dat;
     input [7:0]           local_tag;
+    input [7:0]           flit_seq;
     reg [UCIE_HDR_W-1:0] hdr;
     begin
       hdr = pack_ucie_hdr(
         UCIE_PKT_KIND_AD_REQ,
         UCIE_MSG_MEM_WR_DATA,
         local_tag,
-        16'h0000,
+        48'h0000_0000_0000,
         8'h40,
         8'h00,
-        dat[CHI_DAT_BE_LSB +: 8]
+        dat[CHI_DAT_BE_LSB +: 8],
+        flit_seq
       );
       translate_chi_data_to_ucie = {
         hdr,
@@ -313,11 +331,13 @@ module chi_to_ucie_bridge #(
   endfunction
 
   assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full && hdr_crdt_avail;
-  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag});
+  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag},
+                                                 flit_seq_ctr);
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
-  assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front});
+  assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
+                                                   dat_flit_seq);
   assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 
   // ---------------------------------------------------------------------------
@@ -331,7 +351,7 @@ module chi_to_ucie_bridge #(
     reg [CHI_RSP_W-1:0] rsp;
     reg ok;
     begin
-      ok = ucie_hdr_checksum_ok(hdr) && r_valid &&
+      ok = ucie_hdr_crc16_ok(hdr) && r_valid &&
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_AD_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       rsp = {CHI_RSP_W{1'b0}};
@@ -353,7 +373,7 @@ module chi_to_ucie_bridge #(
     reg ok;
     begin
       hdr = pkt[UCIE_DATA_HDR_LSB +: UCIE_HDR_W];
-      ok = ucie_hdr_checksum_ok(hdr) && r_valid &&
+      ok = ucie_hdr_crc16_ok(hdr) && r_valid &&
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_MEM_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       dat = {CHI_DAT_W{1'b0}};
@@ -372,8 +392,8 @@ module chi_to_ucie_bridge #(
   assign ucie_rx_hdr_ready = bridge_open_ucie && !rsp_w_full;
   assign ucie_rx_data_ready = bridge_open_ucie && !rdat_w_full;
 
-  wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_checksum_ok(ucie_rx_hdr);
-  wire rx_dat_bad = rx_dat_fire && !ucie_hdr_checksum_ok(ucie_rx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]);
+  wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_crc16_ok(ucie_rx_hdr);
+  wire rx_dat_bad = rx_dat_fire && !ucie_hdr_crc16_ok(ucie_rx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]);
 
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
@@ -426,8 +446,8 @@ module chi_to_ucie_bridge #(
   // These are CDC-independent and prove without FIFO reachability constraints.
   always @(posedge ucie_clk) begin
     if (ucie_rst_n) begin
-      assert (ucie_hdr_checksum_ok(ucie_tx_hdr));
-      assert (ucie_hdr_checksum_ok(ucie_tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]));
+      assert (ucie_hdr_crc16_ok(ucie_tx_hdr));
+      assert (ucie_hdr_crc16_ok(ucie_tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]));
       assert (!ucie_tx_data_valid || !wq_empty);
     end
   end

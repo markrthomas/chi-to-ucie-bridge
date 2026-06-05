@@ -36,14 +36,14 @@ module chi_to_ucie_bridge_sva (
   // Every issued UCIe TX header carries a valid checksum.
   a_tx_hdr_csum: assert property (
     @(posedge clk) disable iff (!rst_n)
-    (tx_hdr_valid && tx_hdr_ready) |-> ucie_hdr_checksum_ok(tx_hdr)
+    (tx_hdr_valid && tx_hdr_ready) |-> ucie_hdr_crc16_ok(tx_hdr)
   );
 
   // The header embedded in an issued write-data packet also checks.
   a_tx_data_csum: assert property (
     @(posedge clk) disable iff (!rst_n)
     (tx_data_valid && tx_data_ready) |->
-      ucie_hdr_checksum_ok(tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W])
+      ucie_hdr_crc16_ok(tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W])
   );
 
   // Handshake persistence: while the link stays open, a stalled TX header keeps

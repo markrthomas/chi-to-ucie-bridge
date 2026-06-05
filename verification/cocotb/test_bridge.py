@@ -40,11 +40,12 @@ CHI_RSP_TXNID_LSB = 6
 CHI_RSP_OPCODE_LSB = 14
 CHI_RSP_COMP = 0x4
 
-# ---- UCIe header field positions ----
-UCIE_KIND_LSB = 60
-UCIE_CODE_LSB = 56
-UCIE_TAG_LSB = 48
-UCIE_ADDR_LSB = 32
+# ---- UCIe 128-bit header field positions (bit offsets within the header) ----
+UCIE_KIND_LSB = 124
+UCIE_CODE_LSB = 120
+UCIE_TAG_LSB  = 112
+UCIE_ADDR_LSB = 32   # addr[79:32] — LSB stays 32, width is now 48 bits
+UCIE_HDR_MASK = (1 << 128) - 1
 
 UCIE_PKT_KIND_AD_REQ = 0x8
 UCIE_PKT_KIND_AD_CPL = 0x9
@@ -94,25 +95,34 @@ def make_chi_write_data(txnid, data):
     return flit
 
 
-def pack_ucie_hdr(kind, code, tag, addr16=0, length=0, src_id=0, attr=0):
-    raw = ((kind & 0xF) << 60) | ((code & 0xF) << 56) | ((tag & 0xFF) << 48) \
-        | ((addr16 & 0xFFFF) << 32) | ((length & 0xFF) << 24) \
-        | ((src_id & 0xFF) << 16) | ((attr & 0xFF) << 8)
-    csum = 0
-    for sh in (56, 48, 40, 32, 24, 16, 8):
-        csum ^= (raw >> sh) & 0xFF
-    return raw | (csum & 0xFF)
+def pack_ucie_hdr(kind, code, tag, addr48=0, length=0, src_id=0, attr=0, flit_seq=0):
+    # Layout: [127:124]=kind [123:120]=code [119:112]=tag [111:104]=attr
+    #         [103:96]=length [95:88]=src_id [87:80]=flit_seq [79:32]=addr
+    #         [31:16]=reserved [15:0]=crc16
+    raw = ((kind     & 0xF)              << 124) \
+        | ((code     & 0xF)              << 120) \
+        | ((tag      & 0xFF)             << 112) \
+        | ((attr     & 0xFF)             << 104) \
+        | ((length   & 0xFF)             << 96)  \
+        | ((src_id   & 0xFF)             << 88)  \
+        | ((flit_seq & 0xFF)             << 80)  \
+        | ((addr48   & 0xFFFF_FFFF_FFFF) << 32)
+    crc = 0
+    for sh in (16, 32, 48, 64, 80, 96, 112):
+        crc ^= (raw >> sh) & 0xFFFF
+    return raw | (crc & 0xFFFF)
 
 
 def pack_mem_cpl_data(tag, data):
-    hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag, 0x0040, 0x40, 0x55, 0x00)
+    hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
+                        0x0000_0000_0040, 0x40, 0x55, 0x00, 0x00)
     return (hdr << UCIE_DATA_HDR_LSB) | ((data & MASK512) << 0)
 
 
 def pack_mem_cpl_data_badcrc(tag, data):
-    """A MEM_CPL packet whose embedded header checksum byte is corrupted."""
+    """A MEM_CPL packet whose embedded header CRC field is corrupted."""
     pkt = pack_mem_cpl_data(tag, data)
-    return pkt ^ (0xFF << UCIE_DATA_HDR_LSB)  # flip header[7:0] (the checksum)
+    return pkt ^ (0xFFFF << UCIE_DATA_HDR_LSB)  # flip header[15:0] (the crc16)
 
 
 def data_for(addr16):
@@ -282,7 +292,7 @@ async def test_random_traffic(dut):
             await ReadOnly()
             if dut.ucie_tx_data_ready.value == 1 and dut.ucie_tx_data_valid.value == 1:
                 pkt = int(dut.ucie_tx_data.value)
-                hdr = (pkt >> UCIE_DATA_HDR_LSB) & ((1 << 64) - 1)
+                hdr = (pkt >> UCIE_DATA_HDR_LSB) & UCIE_HDR_MASK
                 tag = field(hdr, UCIE_TAG_LSB, 8)
                 payload = pkt & MASK512
                 info = tag_info.get(tag)
@@ -302,7 +312,7 @@ async def test_random_traffic(dut):
             if pend_adcpl and random.random() < 0.6:
                 chosen = random.choice(pend_adcpl)
                 dut.ucie_rx_hdr.value = pack_ucie_hdr(
-                    UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, chosen, 0, 0, 0x55, 0)
+                    UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, chosen, 0, 0, 0x55, 0, 0)
                 dut.ucie_rx_hdr_valid.value = 1
             else:
                 dut.ucie_rx_hdr_valid.value = 0

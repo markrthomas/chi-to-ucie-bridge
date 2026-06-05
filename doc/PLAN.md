@@ -233,8 +233,33 @@ credit counters on the UCIe TX path:
   remains sound because credits never change during a stall (`hdr_fire = 0` while
   `!ucie_tx_hdr_ready`).
 
-### 4.2–4.4 (planned)
+### 4.2 128-bit UCIe adapter header with full address and flit sequencing (done)
 
-- Replace compact UCIe header model with a closer adapter/flit abstraction
-- Add multi-beat data support
-- Define integration hooks for a UCIe PHY/link-training block
+Replaced the compact 64-bit header model with a 128-bit adapter header:
+
+| Field | Bits | Width | Notes |
+|:---|:---|:---|:---|
+| kind | [127:124] | 4b | packet type (unchanged values) |
+| code | [123:120] | 4b | opcode / status |
+| tag | [119:112] | 8b | local tag |
+| attr | [111:104] | 8b | MemAttr / Order |
+| length | [103:96] | 8b | transfer size |
+| src_id | [95:88] | 8b | requester node ID |
+| flit_seq | [87:80] | 8b | TX flit sequence counter (wraps mod 256) |
+| addr | [79:32] | 48b | **full 48-bit address** (was 16-bit truncated) |
+| reserved | [31:16] | 16b | — |
+| crc16 | [15:0] | 16b | XOR of seven 16-bit slices [127:16] |
+
+Key improvements: (1) `addr` now carries all 48 CHI address bits end-to-end
+instead of the low 16; the directed testbench now checks the full address.
+(2) 16-bit XOR integrity field replaces the old 8-bit XOR.
+(3) `flit_seq` counter (increments on each `hdr_fire`/`data_fire`) is wired
+up in the bridge and piped through all translation functions, ready for §4.3
+sequencing assertions.  `UCIE_DATA_W` widened from 577 to 641 bits accordingly.
+
+All directed sim, lint, cocotb (3/3), and sby formal (3/3 at depth 8) pass.
+
+### 4.3–4.4 (planned)
+
+- Add multi-beat data support (flit sequencer, beat counter, §4.3)
+- Define integration hooks for a UCIe PHY/link-training block (§4.4)

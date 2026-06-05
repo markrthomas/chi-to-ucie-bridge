@@ -190,9 +190,10 @@ module tb_chi_to_ucie_bridge;
   function automatic [UCIE_DATA_W-1:0] pack_rx_data;
     input [7:0] tag;
     input [511:0] data;
-    reg [63:0] hdr;
+    reg [UCIE_HDR_W-1:0] hdr;
     begin
-      hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag, 16'h0040, 8'h40, 8'h55, 8'h00);
+      hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
+                          48'h0000_0000_0040, 8'h40, 8'h55, 8'h00, 8'h00);
       pack_rx_data = {hdr, 1'b0, data};
     end
   endfunction
@@ -218,8 +219,8 @@ module tb_chi_to_ucie_bridge;
     if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== UCIE_MSG_MEM_RD) begin
       $display("FAIL: expected UCIe MEM_RD"); $finish(1);
     end
-    if (ucie_tx_hdr[UCIE_ADDR_MSB:UCIE_ADDR_LSB] !== 16'h1234) begin
-      $display("FAIL: read address low16 mismatch"); $finish(1);
+    if (ucie_tx_hdr[UCIE_ADDR_MSB:UCIE_ADDR_LSB] !== 48'hBEEF_CAFE_1234) begin
+      $display("FAIL: read address mismatch"); $finish(1);
     end
     // Phase 2: the bridge issues a bridge-local tag, not the CHI TxnID. Capture
     // it so the completion can be replayed against the same tag.
@@ -255,7 +256,8 @@ module tb_chi_to_ucie_bridge;
     $display("INFO: UCIe AD_CPL -> CHI RSP smoke (TxnID restored from table)");
     chi_rsp_ready = 1'b1;
     @(posedge ucie_clk);
-    ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, wr_tag, 16'h0000, 8'h00, 8'h55, 8'h00);
+    ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, wr_tag,
+                               48'h0000_0000_0000, 8'h00, 8'h55, 8'h00, 8'h00);
     ucie_rx_hdr_valid = 1'b1;
     while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
     @(posedge ucie_clk);

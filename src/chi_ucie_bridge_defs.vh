@@ -1,9 +1,24 @@
 // Structured field definitions for the CHI <-> UCIe bridge.
 //
-// Compact-model note: CHI uses packed REQ/RSP/DAT flits with explicit fields.
-// UCIe is modeled at the adapter boundary as a 64-bit header plus optional
-// 512-bit payload packet. This is an RTL bring-up model, not a bit-exact CHI or
-// UCIe wire protocol implementation.
+// Phase 4.2: 128-bit UCIe adapter header with full 48-bit address, 16-bit XOR
+// integrity field, and 8-bit flit sequence counter.
+//
+// Header layout (128 bits):
+//   [127:124] kind (4b)      packet type
+//   [123:120] code (4b)      opcode / status
+//   [119:112] tag  (8b)      local tag
+//   [111:104] attr (8b)      MemAttr / Order / misc attributes
+//   [103:96]  length (8b)    transfer size
+//   [95:88]   src_id (8b)    requester node ID
+//   [87:80]   flit_seq (8b)  TX flit sequence counter (wraps at 256)
+//   [79:32]   addr (48b)     full 48-bit address
+//   [31:16]   reserved (16b)
+//   [15:0]    crc16 (16b)    XOR of slices [127:16] — 16-bit integrity field
+//
+// Data packet layout (641 bits):
+//   [640:513] header (128b)
+//   [512]     poison (1b)
+//   [511:0]   data (512b)
 
 `ifndef CHI_UCIE_BRIDGE_DEFS_VH
 `define CHI_UCIE_BRIDGE_DEFS_VH
@@ -15,7 +30,7 @@ localparam integer CHI_UCIE_ADDR_W = 48;
 localparam integer TXNID_W         = 8;
 localparam integer NODEID_W        = 7;
 localparam integer QOS_W           = 4;
-localparam integer UCIE_HDR_W      = 64;
+localparam integer UCIE_HDR_W      = 128;
 localparam integer UCIE_DATA_W     = UCIE_HDR_W + DATA_W + 1;
 
 // ---- CHI opcode model ----
@@ -106,23 +121,28 @@ localparam [3:0] UCIE_CPL_SC           = 4'h1;
 localparam [3:0] UCIE_CPL_UR           = 4'h2;
 localparam [3:0] UCIE_CPL_CA           = 4'h3;
 
-localparam integer UCIE_KIND_MSB       = 63;
-localparam integer UCIE_KIND_LSB       = 60;
-localparam integer UCIE_CODE_MSB       = 59;
-localparam integer UCIE_CODE_LSB       = 56;
-localparam integer UCIE_TAG_MSB        = 55;
-localparam integer UCIE_TAG_LSB        = 48;
-localparam integer UCIE_ADDR_MSB       = 47;
-localparam integer UCIE_ADDR_LSB       = 32;
-localparam integer UCIE_LEN_MSB        = 31;
-localparam integer UCIE_LEN_LSB        = 24;
-localparam integer UCIE_ID_MSB         = 23;
-localparam integer UCIE_ID_LSB         = 16;
-localparam integer UCIE_ATTR_MSB       = 15;
-localparam integer UCIE_ATTR_LSB       = 8;
-localparam integer UCIE_CSUM_MSB       = 7;
-localparam integer UCIE_CSUM_LSB       = 0;
+// ---- UCIe 128-bit header field positions ----
+localparam integer UCIE_KIND_MSB  = 127;
+localparam integer UCIE_KIND_LSB  = 124;
+localparam integer UCIE_CODE_MSB  = 123;
+localparam integer UCIE_CODE_LSB  = 120;
+localparam integer UCIE_TAG_MSB   = 119;
+localparam integer UCIE_TAG_LSB   = 112;
+localparam integer UCIE_ATTR_MSB  = 111;
+localparam integer UCIE_ATTR_LSB  = 104;
+localparam integer UCIE_LEN_MSB   = 103;
+localparam integer UCIE_LEN_LSB   = 96;
+localparam integer UCIE_ID_MSB    = 95;
+localparam integer UCIE_ID_LSB    = 88;
+localparam integer UCIE_SEQ_MSB   = 87;
+localparam integer UCIE_SEQ_LSB   = 80;
+localparam integer UCIE_ADDR_MSB  = 79;
+localparam integer UCIE_ADDR_LSB  = 32;
+// [31:16] reserved
+localparam integer UCIE_CRC_MSB   = 15;
+localparam integer UCIE_CRC_LSB   = 0;
 
+// ---- UCIe data packet field positions (within UCIE_DATA_W-1:0) ----
 localparam integer UCIE_DATA_PAYLOAD_LSB = 0;
 localparam integer UCIE_DATA_POISON_LSB  = UCIE_DATA_PAYLOAD_LSB + DATA_W;
 localparam integer UCIE_DATA_HDR_LSB     = UCIE_DATA_POISON_LSB + 1;
@@ -150,37 +170,40 @@ function automatic is_chi_read;
   end
 endfunction
 
-function automatic [7:0] ucie_checksum;
-  input [63:0] pkt;
+// 16-bit XOR integrity field: XOR of seven 16-bit slices of hdr[127:16].
+// Computed with crc field zeroed; placed in hdr[15:0].
+function automatic [15:0] ucie_crc16;
+  input [127:0] pkt;
   begin
-    ucie_checksum = pkt[63:56] ^ pkt[55:48] ^ pkt[47:40] ^ pkt[39:32] ^
-                    pkt[31:24] ^ pkt[23:16] ^ pkt[15:8];
+    ucie_crc16 = pkt[127:112] ^ pkt[111:96] ^ pkt[95:80] ^ pkt[79:64] ^
+                 pkt[63:48]  ^ pkt[47:32]  ^ pkt[31:16];
   end
 endfunction
 
-function automatic [63:0] pack_ucie_hdr;
+function automatic ucie_hdr_crc16_ok;
+  input [127:0] pkt;
+  reg [127:0] raw;
+  begin
+    raw = pkt;
+    raw[UCIE_CRC_MSB:UCIE_CRC_LSB] = 16'h0000;
+    ucie_hdr_crc16_ok = (pkt[UCIE_CRC_MSB:UCIE_CRC_LSB] == ucie_crc16(raw));
+  end
+endfunction
+
+function automatic [UCIE_HDR_W-1:0] pack_ucie_hdr;
   input [3:0]  kind;
   input [3:0]  code;
   input [7:0]  tag;
-  input [15:0] addr_or_count;
+  input [47:0] addr;
   input [7:0]  length;
   input [7:0]  src_id;
   input [7:0]  attr;
-  reg [63:0] raw;
+  input [7:0]  flit_seq;
+  reg [127:0] raw;
   begin
-    raw = {kind, code, tag, addr_or_count, length, src_id, attr, 8'h00};
-    raw[UCIE_CSUM_MSB:UCIE_CSUM_LSB] = ucie_checksum(raw);
+    raw = {kind, code, tag, attr, length, src_id, flit_seq, addr, 16'h0000, 16'h0000};
+    raw[UCIE_CRC_MSB:UCIE_CRC_LSB] = ucie_crc16(raw);
     pack_ucie_hdr = raw;
-  end
-endfunction
-
-function automatic ucie_hdr_checksum_ok;
-  input [63:0] pkt;
-  reg [63:0] raw;
-  begin
-    raw = pkt;
-    raw[UCIE_CSUM_MSB:UCIE_CSUM_LSB] = 8'h00;
-    ucie_hdr_checksum_ok = (pkt[UCIE_CSUM_MSB:UCIE_CSUM_LSB] == ucie_checksum(raw));
   end
 endfunction
 

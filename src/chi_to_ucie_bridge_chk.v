@@ -22,7 +22,7 @@ module chi_to_ucie_bridge_chk (
       end
 
       if (ucie_tx_hdr_valid && ucie_tx_hdr_ready) begin
-        if (!ucie_hdr_checksum_ok(ucie_tx_hdr)) begin
+        if (!ucie_hdr_crc16_ok(ucie_tx_hdr)) begin
           $display("FAIL: UCIe TX header checksum mismatch");
           $finish(1);
         end
