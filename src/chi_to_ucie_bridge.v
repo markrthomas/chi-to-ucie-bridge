@@ -10,8 +10,8 @@
 
 module chi_to_ucie_bridge #(
   parameter integer FIFO_DEPTH      = 8,
-  parameter integer POSTED_CREDITS  = 8,
-  parameter integer NP_CREDITS      = 8,
+  parameter integer TX_HDR_CREDITS  = 8,
+  parameter integer TX_DAT_CREDITS  = 8,
   parameter integer MAX_OUTSTANDING = 32
 ) (
   input  wire                     clk,
@@ -49,6 +49,11 @@ module chi_to_ucie_bridge #(
   input  wire                     ucie_rx_data_valid,
   input  wire [UCIE_DATA_W-1:0]   ucie_rx_data,
   output wire                     ucie_rx_data_ready,
+
+  input  wire                     ucie_rx_hdr_crdt,
+  input  wire                     ucie_rx_dat_crdt,
+  output wire                     ucie_tx_hdr_crdt,
+  output wire                     ucie_tx_dat_crdt,
 
   input  wire                     link_up,
   input  wire                     err_inj_en,
@@ -126,10 +131,9 @@ module chi_to_ucie_bridge #(
   wire chi_req_is_write = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_read  = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire accept_wr_data   = chi_req_is_write && chi_wr_data_valid && !wdat_w_full;
-  wire req_class_space  = chi_req_is_write ? (POSTED_CREDITS > 0) : (NP_CREDITS > 0);
   wire req_supported    = chi_req_is_write || chi_req_is_read;
 
-  assign chi_req_ready = bridge_open && req_supported && req_class_space && !req_w_full &&
+  assign chi_req_ready = bridge_open && req_supported && !req_w_full &&
                          (!chi_req_is_write || accept_wr_data);
   assign chi_wr_data_ready = bridge_open && chi_req_valid && chi_req_is_write && !req_w_full &&
                              !wdat_w_full;
@@ -181,8 +185,27 @@ module chi_to_ucie_bridge #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // UCIe TX credit counters (ucie_clk domain)
+  // ---------------------------------------------------------------------------
+  wire hdr_crdt_avail;
+  credit_counter #(.CREDITS(TX_HDR_CREDITS)) u_hdr_crdt (
+    .clk(ucie_clk), .rst_n(ucie_rst_n),
+    .consume(hdr_fire), .ret(ucie_rx_hdr_crdt),
+    .available(hdr_crdt_avail)
+  );
+
+  wire dat_crdt_avail;
+  credit_counter #(.CREDITS(TX_DAT_CREDITS)) u_dat_crdt (
+    .clk(ucie_clk), .rst_n(ucie_rst_n),
+    .consume(data_fire), .ret(ucie_rx_dat_crdt),
+    .available(dat_crdt_avail)
+  );
+
   wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
   wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
+  assign ucie_tx_hdr_crdt = rx_hdr_fire;
+  assign ucie_tx_dat_crdt = rx_dat_fire;
   wire [LTAG_W-1:0] rx_hdr_tag = ucie_rx_hdr[UCIE_TAG_LSB +: LTAG_W];
   wire [LTAG_W-1:0] rx_dat_tag = ucie_rx_data[UCIE_DATA_HDR_LSB + UCIE_TAG_LSB +: LTAG_W];
 
@@ -289,11 +312,11 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
-  assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full;
+  assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full && hdr_crdt_avail;
   assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag});
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
-  assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty;
+  assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
   assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front});
   assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 

@@ -210,7 +210,31 @@ payload-stability violation. Fixed: the bridge latches the chosen tag
 
 ## Phase 4 - Protocol Refinement
 
+### 4.1 Negotiated credit accounting (done)
+
+Replaced the placeholder `POSTED_CREDITS`/`NP_CREDITS` parameters with runtime
+credit counters on the UCIe TX path:
+
+- **Parameters**: `TX_HDR_CREDITS` (default 8) and `TX_DAT_CREDITS` (default 8)
+  gate how many in-flight header and data packets the bridge may have outstanding
+  toward the far end at any instant.
+- **New ports**: `ucie_rx_hdr_crdt` / `ucie_rx_dat_crdt` (inputs, far end returns
+  a credit) and `ucie_tx_hdr_crdt` / `ucie_tx_dat_crdt` (outputs, bridge grants
+  a completion slot back to the far end on each `rx_hdr_fire` / `rx_dat_fire`).
+- **Credit counters** (`credit_counter` module, existing): one per TX direction,
+  both in the `ucie_clk` domain; `consume` fires on `hdr_fire`/`data_fire`,
+  `ret` wired to the far-end return port.  `available` gates `ucie_tx_hdr_valid`
+  and `ucie_tx_data_valid` respectively.
+- **cocotb credit model**: `rx_hdr_driver` (write completions) returns 1 header +
+  1 data credit per accepted AD_CPL; `rx_data_driver` (read completions) returns 1
+  header credit per accepted MEM_CPL.  Dedicated `hdr_crdt_returner` /
+  `dat_crdt_returner` coroutines pulse the credit inputs at 1-per-cycle rate.
+- All three sby formal targets still pass at depth 8; the persistence assertion
+  remains sound because credits never change during a stall (`hdr_fire = 0` while
+  `!ucie_tx_hdr_ready`).
+
+### 4.2–4.4 (planned)
+
 - Replace compact UCIe header model with a closer adapter/flit abstraction
-- Add negotiated credit accounting
 - Add multi-beat data support
 - Define integration hooks for a UCIe PHY/link-training block

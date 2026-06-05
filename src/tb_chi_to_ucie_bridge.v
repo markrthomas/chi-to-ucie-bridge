@@ -42,6 +42,11 @@ module tb_chi_to_ucie_bridge;
   reg [UCIE_DATA_W-1:0]  ucie_rx_data;
   wire                   ucie_rx_data_ready;
 
+  reg         ucie_rx_hdr_crdt;
+  reg         ucie_rx_dat_crdt;
+  wire        ucie_tx_hdr_crdt;
+  wire        ucie_tx_dat_crdt;
+
   reg         link_up;
   reg         err_inj_en;
   wire        drain_done;
@@ -85,6 +90,10 @@ module tb_chi_to_ucie_bridge;
     .ucie_rx_data_valid(ucie_rx_data_valid),
     .ucie_rx_data(ucie_rx_data),
     .ucie_rx_data_ready(ucie_rx_data_ready),
+    .ucie_rx_hdr_crdt(ucie_rx_hdr_crdt),
+    .ucie_rx_dat_crdt(ucie_rx_dat_crdt),
+    .ucie_tx_hdr_crdt(ucie_tx_hdr_crdt),
+    .ucie_tx_dat_crdt(ucie_tx_dat_crdt),
     .link_up(link_up),
     .err_inj_en(err_inj_en),
     .drain_done(drain_done),
@@ -122,6 +131,8 @@ module tb_chi_to_ucie_bridge;
       ucie_rx_hdr = {UCIE_HDR_W{1'b0}};
       ucie_rx_data_valid = 1'b0;
       ucie_rx_data = {UCIE_DATA_W{1'b0}};
+      ucie_rx_hdr_crdt = 1'b0;
+      ucie_rx_dat_crdt = 1'b0;
       link_up = 1'b0;
       err_inj_en = 1'b0;
       repeat (8) @(posedge clk);

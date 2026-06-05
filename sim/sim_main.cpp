@@ -49,6 +49,8 @@ int main(int argc, char** argv) {
     dut->ucie_rx_hdr = 0;
     dut->ucie_rx_data_valid = 0;
     zero_wide(dut->ucie_rx_data, 19);
+    dut->ucie_rx_hdr_crdt = 0;
+    dut->ucie_rx_dat_crdt = 0;
     dut->link_up = 0;
     dut->err_inj_en = 0;
     dut->eval();

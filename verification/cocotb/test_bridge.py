@@ -140,6 +140,8 @@ async def reset_and_open(dut):
     dut.ucie_rx_hdr.value = 0
     dut.ucie_rx_data_valid.value = 0
     dut.ucie_rx_data.value = 0
+    dut.ucie_rx_hdr_crdt.value = 0
+    dut.ucie_rx_dat_crdt.value = 0
 
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     cocotb.start_soon(Clock(dut.ucie_clk, 6, units="ns").start())
@@ -246,6 +248,8 @@ async def test_random_traffic(dut):
     tag_info = {}                 # local tag -> dict(is_write, addr16)
     pend_adcpl = []               # local tags awaiting AD_CPL (write completion)
     pend_memcpl = []              # (local tag, data) awaiting MEM_CPL (read completion)
+    pend_hdr_crdts = [0]          # TX header credits to return to bridge
+    pend_dat_crdts = [0]          # TX data credits to return to bridge
 
     N = 80
     MAX_INFLIGHT = 12
@@ -307,6 +311,8 @@ async def test_random_traffic(dut):
             await RisingEdge(dut.ucie_clk)
             if took:
                 pend_adcpl.remove(chosen)
+                pend_hdr_crdts[0] += 1  # write consumed 1 hdr credit
+                pend_dat_crdts[0] += 1  # write consumed 1 dat credit
 
     # ---- UCIe RX data driver: return MEM_CPL (read completions), out of order ----
     async def rx_data_driver():
@@ -323,6 +329,26 @@ async def test_random_traffic(dut):
             await RisingEdge(dut.ucie_clk)
             if took:
                 pend_memcpl.remove(chosen)
+                pend_hdr_crdts[0] += 1  # read consumed 1 hdr credit
+
+    # ---- Credit returners: pulse ucie_rx_hdr/dat_crdt when credits are due ----
+    async def hdr_crdt_returner():
+        while state["running"]:
+            if pend_hdr_crdts[0] > 0:
+                pend_hdr_crdts[0] -= 1
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+            await RisingEdge(dut.ucie_clk)
+
+    async def dat_crdt_returner():
+        while state["running"]:
+            if pend_dat_crdts[0] > 0:
+                pend_dat_crdts[0] -= 1
+                dut.ucie_rx_dat_crdt.value = 1
+            else:
+                dut.ucie_rx_dat_crdt.value = 0
+            await RisingEdge(dut.ucie_clk)
 
     # ---- CHI RSP sink: write completions ----
     async def chi_rsp_sink():
@@ -354,7 +380,7 @@ async def test_random_traffic(dut):
             await RisingEdge(dut.clk)
 
     for c in (tx_hdr_consumer, tx_data_consumer, rx_hdr_driver, rx_data_driver,
-              chi_rsp_sink, chi_comp_sink):
+              chi_rsp_sink, chi_comp_sink, hdr_crdt_returner, dat_crdt_returner):
         cocotb.start_soon(c())
 
     # ---- Stimulus: issue N requests with unique outstanding TxnIDs ----
@@ -433,6 +459,7 @@ async def test_random_errors(dut):
     inuse = set()
     expected = {}                 # txnid -> expected data
     pend = []                     # (tag, data, corrupt)
+    pend_hdr_crdts = [0]          # TX header credits to return to bridge
     cov_csum = CoverGroup("rx_checksum", ["good", "bad"])
     cov_resp = CoverGroup("read_resperr", ["ok", "derr"])
 
@@ -474,6 +501,16 @@ async def test_random_errors(dut):
             await RisingEdge(dut.ucie_clk)
             if took:
                 pend.remove(chosen)
+                pend_hdr_crdts[0] += 1  # read consumed 1 hdr credit
+
+    async def hdr_crdt_returner():
+        while st["running"]:
+            if pend_hdr_crdts[0] > 0:
+                pend_hdr_crdts[0] -= 1
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+            await RisingEdge(dut.ucie_clk)
 
     async def chi_comp_sink():
         while st["running"]:
@@ -501,7 +538,7 @@ async def test_random_errors(dut):
                 inuse.discard(txnid)
             await RisingEdge(dut.clk)
 
-    for c in (tx_hdr_consumer, rx_data_driver, chi_comp_sink):
+    for c in (tx_hdr_consumer, rx_data_driver, hdr_crdt_returner, chi_comp_sink):
         cocotb.start_soon(c())
 
     addr_ctr = 0
