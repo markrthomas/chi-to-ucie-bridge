@@ -31,17 +31,15 @@ make clean
 |:----------------------|:----------------------------------|:--------------------|
 | Coverage (line/toggle/user) | yes (`--coverage`, see `make coverage`) | no                  |
 | SVA concurrent assertions   | yes (`--assert`, `BRIDGE_SVA`)          | not supported       |
-| cocotb stimulus/scoreboard  | see note below                          | yes                 |
+| cocotb stimulus/scoreboard  | yes (cocotb ≥ 1.9.2)                   | yes                 |
 
 - **Coverage + SVA together (no cocotb):** `make coverage` at the repo root
   compiles `src/chi_to_ucie_bridge_sva.sv` with `--assert --coverage` and writes
   `sim/coverage.info` (includes the SVA cover points).
-- **cocotb under Icarus:** the working stimulus path on this box today.
-- **cocotb under Verilator:** the build is correct (`--assert --coverage` are
-  passed through), but the installed Verilator 5.047-devel + cocotb 1.8.1 pairing
-  does not deliver value-change callbacks, so cocotb clocks do not advance and
-  tests time out. Use a matched cocotb/Verilator release to enable it; the
-  Makefile path is ready.
+- **cocotb under Icarus:** default path; Icarus does not support concurrent SVA.
+- **cocotb under Verilator:** fully working with cocotb ≥ 1.9.2. cocotb 1.8.x
+  did not deliver VPI value-change callbacks with Verilator 5.x, so clocks stalled.
+  Upgrade with `pip3.10 install --user "cocotb==1.9.2"` if needed.
 
 ## Environment note
 

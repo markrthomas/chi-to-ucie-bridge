@@ -148,14 +148,22 @@ data is never offered before its request header (`!tx_data_valid || !wq_empty`).
 These are CDC-independent so they prove without extra reachability constraints,
 alongside the existing `txn_table` allocation proof.
 
-### 3.6 Next increments
+### 3.6 cocotb-on-Verilator resolved (done)
+
+Upgrading cocotb from 1.8.1 to 1.9.2 (for the pinned `/usr/bin/python3.10`
+interpreter) resolved the VPI value-change callback incompatibility with
+Verilator 5.047-devel. All three randomized cocotb tests (`test_read_translates`,
+`test_random_traffic`, `test_random_errors`) now pass under `make SIM=verilator`
+with `--assert` (SVA) and `--coverage` active, alongside the Icarus path.
+
+### 3.7 Next increments
 
 - Deeper temporal/handshake formal (TX header stability, CHI output stability)
   needs the async-FIFO CDC modelled with reset/init constraints to avoid
   spurious counterexamples; today those are covered by the bound SVA under
   Verilator and by the randomized cocotb scoreboard.
-- Resolve the cocotb-on-Verilator callback issue (version pairing) so SVA +
-  coverage run under the randomized stimulus, not just `sim_main`.
+- Merge the cocotb `sim_build/` coverage output with the directed `sim/coverage.info`
+  so a single `lcov` report covers both stimulus sources.
 
 ### Resolved (found via SVA review)
 
