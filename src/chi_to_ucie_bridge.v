@@ -398,4 +398,22 @@ module chi_to_ucie_bridge #(
     end
   end
 
+`ifdef FORMAL
+  // Bounded protocol invariants on the UCIe TX path (ucie_clk domain). These
+  // are single-domain checks that do not depend on the async-FIFO CDC, so they
+  // prove without extra reachability constraints. Deeper temporal/handshake
+  // properties are covered by the bound SVA under Verilator.
+  always @(posedge ucie_clk) begin
+    if (ucie_rst_n) begin
+      // Every presented UCIe header carries a correct checksum (the translation
+      // packs it), so the link never sees a malformed outgoing header.
+      assert (ucie_hdr_checksum_ok(ucie_tx_hdr));
+      assert (ucie_hdr_checksum_ok(ucie_tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]));
+      // Write data is never offered before its request header (its local tag is
+      // queued first), preserving header-before-data ordering to the link.
+      assert (!ucie_tx_data_valid || !wq_empty);
+    end
+  end
+`endif
+
 endmodule

@@ -139,11 +139,21 @@ The Verilator `cover property` points (in the SVA module) remain the
 assertion-engine path; they are exercised once the cocotb-on-Verilator issue
 below is resolved.
 
-### 3.5 Next increments
+### 3.5 Bridge formal: bounded protocol invariants (done)
 
-- Raise the bridge formal proof from smoke to bounded protocol properties
-  (building on the `txn_table` proof already in place); consider binding the SVA
-  module into the formal flow.
+The bridge top proof is no longer a vacuous smoke. An `ifdef FORMAL` block adds
+bounded, single-domain invariants on the UCIe TX path (ucie_clk): every
+presented header (request and write-data) carries a correct checksum, and write
+data is never offered before its request header (`!tx_data_valid || !wq_empty`).
+These are CDC-independent so they prove without extra reachability constraints,
+alongside the existing `txn_table` allocation proof.
+
+### 3.6 Next increments
+
+- Deeper temporal/handshake formal (TX header stability, CHI output stability)
+  needs the async-FIFO CDC modelled with reset/init constraints to avoid
+  spurious counterexamples; today those are covered by the bound SVA under
+  Verilator and by the randomized cocotb scoreboard.
 - Resolve the cocotb-on-Verilator callback issue (version pairing) so SVA +
   coverage run under the randomized stimulus, not just `sim_main`.
 
