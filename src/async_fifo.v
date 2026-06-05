@@ -106,4 +106,56 @@ module async_fifo #(
 
   assign r_data = mem[r_ptr_bin[ADDR_W-1:0]];
 
+`ifdef FORMAL
+  // CDC reachability constraints.  The RTL maintains all of these invariants
+  // by construction after reset; stating them as `assume` lets the SMT solver
+  // start from reachable initial states and avoids three classes of spurious
+  // counterexamples:
+  //   (a) Gray code doesn't match binary pointer -> invalid full/empty decode.
+  //   (b) Sync chain shows over-full or impossible fill level.
+  //   (c) Intermediate sync stage is behind the output stage (ptr moved backward).
+
+  localparam [ADDR_W:0] F_MAX_FILL = DEPTH[ADDR_W:0];
+
+  function automatic [ADDR_W:0] f_gray2bin;
+    input [ADDR_W:0] g;
+    integer k;
+    begin
+      f_gray2bin[ADDR_W] = g[ADDR_W];
+      for (k = ADDR_W-1; k >= 0; k = k-1)
+        f_gray2bin[k] = f_gray2bin[k+1] ^ g[k];
+    end
+  endfunction
+
+  // Write-domain constraints (evaluated at every posedge w_clk after reset).
+  always @(posedge w_clk) begin
+    if (w_rst_n) begin
+      // Gray code is consistent with the binary write pointer.
+      assume (w_ptr_gray == (w_ptr_bin ^ (w_ptr_bin >> 1)));
+      // Apparent fill seen from the write side is in [0, DEPTH].
+      assume ((w_ptr_bin - f_gray2bin(r_ptr_gray_sync)) <= F_MAX_FILL);
+      // Intermediate sync stage not behind the output stage (r_ptr monotone).
+      assume ((f_gray2bin(r_sync0_w) - f_gray2bin(r_sync1_w)) <= F_MAX_FILL);
+    end
+  end
+
+  // Read-domain constraints (evaluated at every posedge r_clk after reset).
+  always @(posedge r_clk) begin
+    if (r_rst_n) begin
+      // Gray code is consistent with the binary read pointer.
+      assume (r_ptr_gray == (r_ptr_bin ^ (r_ptr_bin >> 1)));
+      // Apparent fill seen from the read side is in [0, DEPTH].
+      assume ((f_gray2bin(w_ptr_gray_sync) - r_ptr_bin) <= F_MAX_FILL);
+      // Intermediate sync stage not behind the output stage (w_ptr monotone).
+      assume ((f_gray2bin(w_sync0_r) - f_gray2bin(w_sync1_r)) <= F_MAX_FILL);
+      // Cross-domain fill ordering: the read side's apparent fill cannot exceed
+      // the write side's actual fill.  This eliminates spurious initial states
+      // where the synced write pointer shows more items than actually exist
+      // (impossible in hardware because the sync chain only lags, never leads).
+      assume ((f_gray2bin(w_ptr_gray_sync) - r_ptr_bin) <=
+              (w_ptr_bin - f_gray2bin(r_ptr_gray_sync)));
+    end
+  end
+`endif
+
 endmodule

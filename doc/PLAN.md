@@ -165,12 +165,38 @@ depends on `coverage` so the directed-sim run is always fresh. The merge adds
 `chi_ucie_bridge_defs.vh` at 100% line coverage (function bodies exercised only
 under cocotb randomized stimulus).
 
-### 3.8 Next increments
+### 3.8 Async-FIFO CDC formal + temporal handshake invariants (done)
 
-- Deeper temporal/handshake formal (TX header stability, CHI output stability)
-  needs the async-FIFO CDC modelled with reset/init constraints to avoid
-  spurious counterexamples; today those are covered by the bound SVA under
-  Verilator and by the randomized cocotb scoreboard.
+The async-FIFO `ifdef FORMAL` block now carries three layers of reachability
+constraints that let the SMT solver start from physically possible states:
+
+1. **Gray-code consistency** — each pointer's Gray code matches its binary value.
+2. **Fill-level bounds** — apparent fill from either domain stays in `[0, DEPTH]`.
+3. **Sync-chain monotonicity** — the intermediate sync stage is never ahead of
+   the output stage (pointer only advances).
+4. **Cross-domain fill ordering** (new) — the read side's apparent fill cannot
+   exceed the write side's actual fill.  This cross-domain assume rules out the
+   class of spurious initial states where the synced write pointer shows more
+   items than actually exist (impossible because the sync chain only lags, never
+   leads the actual pointer).
+
+With those constraints in place the bridge's `ifdef FORMAL` block was extended
+with `$past()`-based temporal assertions (yosys-compatible form of the SVA
+`|=>` properties):
+
+- **UCIe TX header persistence** — a stalled valid header stays valid until
+  accepted or the link closes (`$past(ucie_rst_n)` guard mirrors SVA
+  `disable iff (!rst_n)` semantics over the two-cycle window).
+- **UCIe TX header stability** — a stalled header's payload (including the local
+  tag) does not change while the handshake is unresolved.
+- **CHI completion persistence and stability** — both RSP and CompData outputs
+  hold valid and stable payload until the CHI consumer accepts them.
+
+All three SymbiYosys targets (`reset_drain`, `txn_table`, `chi_to_ucie_bridge`)
+pass at BMC depth 8.  The `chi_to_ucie_bridge_sva.sv` module was updated to use
+explicit `@(posedge clk) disable iff (…)` on every property (removing
+`default clocking` and `default disable iff`) so the same file compiles cleanly
+under both Verilator `--assert` and a future yosys SVA flow.
 
 ### Resolved (found via SVA review)
 

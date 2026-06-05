@@ -399,19 +399,54 @@ module chi_to_ucie_bridge #(
   end
 
 `ifdef FORMAL
-  // Bounded protocol invariants on the UCIe TX path (ucie_clk domain). These
-  // are single-domain checks that do not depend on the async-FIFO CDC, so they
-  // prove without extra reachability constraints. Deeper temporal/handshake
-  // properties are covered by the bound SVA under Verilator.
+  // ---- Single-cycle TX-path invariants (ucie_clk domain) ----
+  // These are CDC-independent and prove without FIFO reachability constraints.
   always @(posedge ucie_clk) begin
     if (ucie_rst_n) begin
-      // Every presented UCIe header carries a correct checksum (the translation
-      // packs it), so the link never sees a malformed outgoing header.
       assert (ucie_hdr_checksum_ok(ucie_tx_hdr));
       assert (ucie_hdr_checksum_ok(ucie_tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]));
-      // Write data is never offered before its request header (its local tag is
-      // queued first), preserving header-before-data ordering to the link.
       assert (!ucie_tx_data_valid || !wq_empty);
+    end
+  end
+
+  // ---- Temporal handshake invariants ($past-based for yosys compatibility) ----
+  // f_*_past_valid prevents $past from being evaluated before the first real
+  // clock edge (where $past returns X and all conditions become false).
+  reg f_ucie_past_valid;
+  reg f_chi_past_valid;
+  initial begin
+    f_ucie_past_valid = 0;
+    f_chi_past_valid  = 0;
+  end
+  always @(posedge ucie_clk) f_ucie_past_valid <= ucie_rst_n;
+  always @(posedge clk)      f_chi_past_valid  <= clk_rst_n;
+
+  // UCIe TX path: a stalled valid header stays valid and payload-stable until
+  // either it is accepted or the link closes.  With the async-FIFO CDC assumes
+  // in place, the req_fifo read-side state can no longer transition spuriously,
+  // making these properties provable at depth 8.
+  always @(posedge ucie_clk) begin
+    if (ucie_rst_n && f_ucie_past_valid) begin
+      if ($past(ucie_tx_hdr_valid) && !$past(ucie_tx_hdr_ready) &&
+          $past(bridge_open_ucie) && $past(ucie_rst_n)) begin
+        assert (ucie_tx_hdr_valid  || !bridge_open_ucie);
+        assert ($stable(ucie_tx_hdr) || !bridge_open_ucie);
+      end
+    end
+  end
+
+  // CHI completion outputs (clk domain): a presented completion holds valid
+  // and stable payload until the consumer accepts it.
+  always @(posedge clk) begin
+    if (clk_rst_n && f_chi_past_valid) begin
+      if ($past(chi_rsp_valid) && !$past(chi_rsp_ready)) begin
+        assert (chi_rsp_valid);
+        assert ($stable(chi_rsp_data));
+      end
+      if ($past(chi_comp_data_valid) && !$past(chi_comp_data_ready)) begin
+        assert (chi_comp_data_valid);
+        assert ($stable(chi_comp_data));
+      end
     end
   end
 `endif

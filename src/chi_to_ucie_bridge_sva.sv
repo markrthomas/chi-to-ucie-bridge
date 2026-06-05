@@ -30,16 +30,18 @@ module chi_to_ucie_bridge_sva (
 );
 
 `ifdef BRIDGE_SVA
-  default clocking cb @(posedge clk); endclocking
-  default disable iff (!rst_n);
+  // UCIe TX path (ucie_clk domain).  Explicit clocking used on every property
+  // for compatibility with both Verilator --assert and yosys/SymbiYosys formal.
 
   // Every issued UCIe TX header carries a valid checksum.
   a_tx_hdr_csum: assert property (
+    @(posedge clk) disable iff (!rst_n)
     (tx_hdr_valid && tx_hdr_ready) |-> ucie_hdr_checksum_ok(tx_hdr)
   );
 
   // The header embedded in an issued write-data packet also checks.
   a_tx_data_csum: assert property (
+    @(posedge clk) disable iff (!rst_n)
     (tx_data_valid && tx_data_ready) |->
       ucie_hdr_checksum_ok(tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W])
   );
@@ -47,18 +49,21 @@ module chi_to_ucie_bridge_sva (
   // Handshake persistence: while the link stays open, a stalled TX header keeps
   // its valid asserted until accepted (it may drop only if the link closes).
   a_tx_hdr_persist: assert property (
+    @(posedge clk) disable iff (!rst_n)
     (tx_hdr_valid && !tx_hdr_ready && open) |=> (tx_hdr_valid || !open)
   );
 
   // Payload stability: a stalled TX header holds its value (incl. local tag)
   // until accepted, so the local tag cannot shift mid-handshake.
   a_tx_hdr_stable: assert property (
+    @(posedge clk) disable iff (!rst_n)
     (tx_hdr_valid && !tx_hdr_ready && open) |=> ($stable(tx_hdr) || !open)
   );
 
   // Ordering: write data is never offered before its request header has been
   // issued (i.e. its local tag is queued).
   a_data_after_hdr: assert property (
+    @(posedge clk) disable iff (!rst_n)
     tx_data_valid |-> !wq_empty
   );
 
@@ -82,10 +87,14 @@ module chi_to_ucie_bridge_sva (
   );
 
   // Coverage: confirm the interesting events are actually exercised.
-  c_hdr_issued:  cover property (tx_hdr_valid && tx_hdr_ready);
-  c_data_issued: cover property (tx_data_valid && tx_data_ready);
-  c_rsp_accepted:  cover property (@(posedge clk_chi) chi_rsp_valid && chi_rsp_ready);
-  c_comp_accepted: cover property (@(posedge clk_chi) chi_comp_data_valid && chi_comp_data_ready);
+  c_hdr_issued:  cover property (@(posedge clk) disable iff (!rst_n)
+                   tx_hdr_valid && tx_hdr_ready);
+  c_data_issued: cover property (@(posedge clk) disable iff (!rst_n)
+                   tx_data_valid && tx_data_ready);
+  c_rsp_accepted:  cover property (@(posedge clk_chi) disable iff (!rst_chi)
+                     chi_rsp_valid && chi_rsp_ready);
+  c_comp_accepted: cover property (@(posedge clk_chi) disable iff (!rst_chi)
+                     chi_comp_data_valid && chi_comp_data_ready);
 `endif
 
 endmodule
