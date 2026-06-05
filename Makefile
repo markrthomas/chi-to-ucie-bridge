@@ -22,9 +22,10 @@ BRIDGE_SRCS := \
 # Bound concurrent SVA properties, enabled under Verilator's assertion engine.
 SVA_SRC  := src/chi_to_ucie_bridge_sva.sv
 SVA_ARGS := --assert +define+BRIDGE_SVA
-COV_DIR := sim/obj_dir_cov
+COV_DIR  := sim/obj_dir_cov
+COCOTB_COV := verification/cocotb/coverage.dat
 
-.PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage formal synth ci clean
+.PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all formal synth ci clean
 
 help:
 	@echo "chi-to-ucie-bridge - common targets"
@@ -37,7 +38,8 @@ help:
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
 	@echo "  make vlt-gtkwave - make vlt-vcd, then open the Verilator VCD"
 	@echo "  make regress   - lint + sim"
-	@echo "  make coverage  - Verilator coverage + SVA (--assert) run -> sim/coverage.info"
+	@echo "  make coverage      - Verilator coverage + SVA (--assert) run -> sim/coverage.info"
+	@echo "  make coverage-all  - merge directed + cocotb coverage -> sim/coverage_merged.info"
 	@echo "  make formal    - SymbiYosys smoke targets"
 	@echo "  make synth     - Yosys synthesis smoke"
 	@echo "  make clean     - remove generated artifacts"
@@ -95,6 +97,16 @@ coverage:
 	echo "[COVERAGE] sim/coverage.info written from sim/sim_main.cpp execution"; \
 	verilator_coverage --annotate $(COV_DIR)/annotated $(COV_DIR)/coverage.dat >/dev/null 2>&1 || true
 
+coverage-all: coverage
+	@set -e; \
+	if [ ! -f $(COCOTB_COV) ]; then \
+		echo "[COVERAGE-ALL] $(COCOTB_COV) not found; run 'make SIM=verilator' in verification/cocotb first"; \
+		exit 1; \
+	fi; \
+	verilator_coverage --write-info sim/coverage_merged.info \
+		$(COV_DIR)/coverage.dat $(COCOTB_COV); \
+	echo "[COVERAGE-ALL] sim/coverage_merged.info written (directed + cocotb merged)"
+
 formal:
 	$(MAKE) -C verification/formal
 
@@ -115,4 +127,4 @@ ci: regress formal synth
 clean:
 	$(MAKE) -C verification/directed clean
 	-$(MAKE) -C verification/formal clean
-	rm -rf $(COV_DIR) $(VCD_DIR) sim/coverage.info sim/synth.log sim/coverage.dat
+	rm -rf $(COV_DIR) $(VCD_DIR) sim/coverage.info sim/coverage_merged.info sim/synth.log sim/coverage.dat

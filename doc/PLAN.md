@@ -156,14 +156,21 @@ Verilator 5.047-devel. All three randomized cocotb tests (`test_read_translates`
 `test_random_traffic`, `test_random_errors`) now pass under `make SIM=verilator`
 with `--assert` (SVA) and `--coverage` active, alongside the Icarus path.
 
-### 3.7 Next increments
+### 3.7 Unified coverage report (done)
+
+`make coverage-all` merges the directed-sim `sim/obj_dir_cov/coverage.dat` with
+the cocotb/Verilator `verification/cocotb/coverage.dat` into
+`sim/coverage_merged.info` using `verilator_coverage --write-info`. The target
+depends on `coverage` so the directed-sim run is always fresh. The merge adds
+`chi_ucie_bridge_defs.vh` at 100% line coverage (function bodies exercised only
+under cocotb randomized stimulus).
+
+### 3.8 Next increments
 
 - Deeper temporal/handshake formal (TX header stability, CHI output stability)
   needs the async-FIFO CDC modelled with reset/init constraints to avoid
   spurious counterexamples; today those are covered by the bound SVA under
   Verilator and by the randomized cocotb scoreboard.
-- Merge the cocotb `sim_build/` coverage output with the directed `sim/coverage.info`
-  so a single `lcov` report covers both stimulus sources.
 
 ### Resolved (found via SVA review)
 
