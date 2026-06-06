@@ -99,9 +99,28 @@ module chi_to_ucie_bridge #(
   wire [CHI_RSP_W-1:0] rsp_r_data;
   wire [CHI_DAT_W-1:0] rdat_r_data;
 
-  // UCIe TX accept pulses (declared early; used in the FIFO read enables below).
+  // Internal control pulses (declared early for Icarus compatibility)
   wire hdr_fire;
   wire data_fire;
+  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
+  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
+
+  // Multi-beat burst counters (§4.3)
+  reg [2:0] tx_dat_beat_ctr;
+  wire tx_dat_last = (tx_dat_beat_ctr == 3'd4);
+  reg [2:0] rx_dat_beat_ctr;
+  wire rx_dat_last = (rx_dat_beat_ctr == 3'd4);
+
+  // Flit sequence counter
+  reg [7:0] flit_seq_ctr;
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n)
+      flit_seq_ctr <= 8'h00;
+    else
+      flit_seq_ctr <= flit_seq_ctr + {7'h0, hdr_fire} + {7'h0, data_fire};
+  end
+  // When header and data fire simultaneously, data gets the next sequence number.
+  wire [7:0] dat_flit_seq = flit_seq_ctr + {7'h0, hdr_fire};
 
   wire req_r_empty_clk;
   wire wdat_r_empty_clk;
@@ -159,6 +178,14 @@ module chi_to_ucie_bridge #(
   );
 
   // ---------------------------------------------------------------------------
+  // Transaction table (ucie_clk domain)
+  // ---------------------------------------------------------------------------
+  wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire [LTAG_W-1:0]   free_tag;
+  wire                tbl_full;
+  wire                tbl_tag_err;
+
+  // ---------------------------------------------------------------------------
   // UCIe TX credit counters (ucie_clk domain)
   // ---------------------------------------------------------------------------
   wire hdr_crdt_avail;
@@ -168,11 +195,7 @@ module chi_to_ucie_bridge #(
     .available(hdr_crdt_avail)
   );
 
-  // Multi-beat burst counters (§4.3)
-  reg [2:0] tx_dat_beat_ctr;
-  wire tx_dat_last = (tx_dat_beat_ctr == 3'd4);
   wire dat_crdt_avail;
-
   credit_counter #(.CREDITS(TX_DAT_CREDITS)) u_dat_crdt (
     .clk(ucie_clk), .rst_n(ucie_rst_n),
     .consume(data_fire && tx_dat_beat_ctr == 3'd0), .ret(ucie_rx_dat_crdt),
@@ -186,9 +209,6 @@ module chi_to_ucie_bridge #(
       tx_dat_beat_ctr <= tx_dat_last ? 3'd0 : tx_dat_beat_ctr + 3'd1;
   end
 
-  reg [2:0] rx_dat_beat_ctr;
-  wire rx_dat_last = (rx_dat_beat_ctr == 3'd4);
-
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n)
       rx_dat_beat_ctr <= 3'd0;
@@ -196,8 +216,6 @@ module chi_to_ucie_bridge #(
       rx_dat_beat_ctr <= rx_dat_last ? 3'd0 : rx_dat_beat_ctr + 3'd1;
   end
 
-  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
-  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
   assign ucie_tx_hdr_crdt = rx_hdr_fire;
   assign ucie_tx_dat_crdt = rx_dat_fire && rx_dat_last;
 
@@ -211,14 +229,6 @@ module chi_to_ucie_bridge #(
   wire [LTAG_W-1:0] rx_dat_tag = (rx_dat_beat_ctr == 3'd0) ?
                                  ucie_rx_data[UCIE_TAG_LSB +: LTAG_W] :
                                  rx_dat_tag_latched;
-
-  // ---------------------------------------------------------------------------
-  // Transaction table (ucie_clk domain)
-  // ---------------------------------------------------------------------------
-  wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire [LTAG_W-1:0]   free_tag;
-  wire                tbl_full;
-  wire                tbl_tag_err;
 
   // Hold the local tag stable for the whole header handshake. Without this the
   // presented tag could change mid-stall if a completion frees a lower slot,
@@ -303,20 +313,6 @@ module chi_to_ucie_bridge #(
     end
   end
 
-  // ---------------------------------------------------------------------------
-  // Flit sequence counter (ucie_clk domain): increments per issued TX packet.
-  // Used by both hdr and data translation functions for sequencing in §4.3.
-  // ---------------------------------------------------------------------------
-  reg [7:0] flit_seq_ctr;
-  always @(posedge ucie_clk or negedge ucie_rst_n) begin
-    if (!ucie_rst_n)
-      flit_seq_ctr <= 8'h00;
-    else
-      flit_seq_ctr <= flit_seq_ctr + {7'h0, hdr_fire} + {7'h0, data_fire};
-  end
-  // When header and data fire simultaneously, data gets the next sequence number.
-  wire [7:0] dat_flit_seq = flit_seq_ctr + {7'h0, hdr_fire};
-
   reg  [7:0] held_dat_seq;
   reg        held_dat_v;
   wire [7:0] present_dat_seq = held_dat_v ? held_dat_seq : dat_flit_seq;
@@ -362,8 +358,7 @@ module chi_to_ucie_bridge #(
   end
 
   // Combinational full 512-bit data for the last beat
-  wire [511:0] rx_dat_full = (rx_dat_beat_ctr == 3'd4) ?
-                             {ucie_rx_data, rx_dat_accum[383:0]} : 512'h0;
+  wire [511:0] rx_dat_full = {ucie_rx_data, rx_dat_accum[383:0]};
 
   reg [TXNID_W-1:0] rx_dat_txnid_latched;
   reg               rx_dat_valid_latched;
