@@ -15,10 +15,12 @@
 //   [31:16]   reserved (16b)
 //   [15:0]    crc16 (16b)    XOR of slices [127:16] — 16-bit integrity field
 //
-// Data packet layout (641 bits):
-//   [640:513] header (128b)
-//   [512]     poison (1b)
-//   [511:0]   data (512b)
+// Data packet layout (§4.3: multi-beat):
+// A data burst (e.g. CHI WriteData or ReadData) spans UCIE_DATA_BEATS+1 flits
+// on the data channel (ucie_tx_data / ucie_rx_data):
+//   Beat 0:    128-bit adapter header (kind=AD_REQ/MEM_CPL, code=WR_DATA/RD_DATA)
+//   Beat 1..4: 128-bit data payload flits (pure data)
+// Total 512 bits of data over 4 beats. Poison is carried in the Beat 0 header.
 
 `ifndef CHI_UCIE_BRIDGE_DEFS_VH
 `define CHI_UCIE_BRIDGE_DEFS_VH
@@ -31,7 +33,8 @@ localparam integer TXNID_W         = 8;
 localparam integer NODEID_W        = 7;
 localparam integer QOS_W           = 4;
 localparam integer UCIE_HDR_W      = 128;
-localparam integer UCIE_DATA_W     = UCIE_HDR_W + DATA_W + 1;
+localparam integer UCIE_DATA_W     = UCIE_HDR_W;   // §4.3: single flit width; data spans UCIE_DATA_BEATS flits
+localparam integer UCIE_DATA_BEATS = 4;             // data beats per write/read-cpl burst (4 × 128b = 512b)
 
 // ---- CHI opcode model ----
 localparam [6:0] CHI_REQ_READNOSNP       = 7'h04;
@@ -141,11 +144,6 @@ localparam integer UCIE_ADDR_LSB  = 32;
 // [31:16] reserved
 localparam integer UCIE_CRC_MSB   = 15;
 localparam integer UCIE_CRC_LSB   = 0;
-
-// ---- UCIe data packet field positions (within UCIE_DATA_W-1:0) ----
-localparam integer UCIE_DATA_PAYLOAD_LSB = 0;
-localparam integer UCIE_DATA_POISON_LSB  = UCIE_DATA_PAYLOAD_LSB + DATA_W;
-localparam integer UCIE_DATA_HDR_LSB     = UCIE_DATA_POISON_LSB + 1;
 
 function automatic is_chi_write;
   input [6:0] opcode;

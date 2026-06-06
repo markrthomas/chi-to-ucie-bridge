@@ -259,7 +259,16 @@ sequencing assertions.  `UCIE_DATA_W` widened from 577 to 641 bits accordingly.
 
 All directed sim, lint, cocotb (3/3), and sby formal (3/3 at depth 8) pass.
 
-### 4.3–4.4 (planned)
+### 4.3 Multi-beat data support (done)
 
-- Add multi-beat data support (flit sequencer, beat counter, §4.3)
-- Define integration hooks for a UCIe PHY/link-training block (§4.4)
+Implemented multi-beat data protocol (§4.3): 512-bit data bursts are split into
+a 5-beat sequence on the data channel (ucie_tx_data / ucie_rx_data).
+- Beat 0: 128-bit adapter header (kind=AD_REQ/MEM_CPL, code=WR_DATA/RD_DATA).
+- Beat 1..4: 128-bit data payload flits (pure data).
+- Poison bit is carried in the Beat 0 header (attr[7]).
+- Beat counters (tx_dat_beat_ctr, rx_dat_beat_ctr) track burst progress.
+- Credit accounting updated to be per-burst (packet) rather than per-flit.
+- Stability latches added for flit_seq_ctr to ensure stalled headers remain valid.
+- cocotb and formal verification updated to match the new protocol.
+
+### 4.4 integration hooks for a UCIe PHY/link-training block (planned)

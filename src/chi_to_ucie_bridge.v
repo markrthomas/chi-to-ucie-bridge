@@ -5,6 +5,9 @@
 // original CHI identity is restored from the table when the completion returns.
 // Retains the Phase 1 dual-clock async FIFOs, compact UCIe adapter packet model,
 // and link readiness gating.
+//
+// Phase 4.3: multi-beat data support. 512-bit data bursts are split into 4 beats
+// of 128-bit data, preceded by a 128-bit header flit (5 beats total).
 
 `include "chi_ucie_bridge_defs.vh"
 
@@ -151,9 +154,63 @@ module chi_to_ucie_bridge #(
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_wdat_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(wdat_w_en), .w_data(chi_wr_data), .w_full(wdat_w_full),
-    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire && tx_dat_last),
     .r_data(wdat_r_data), .r_empty(wdat_r_empty)
   );
+
+  // ---------------------------------------------------------------------------
+  // UCIe TX credit counters (ucie_clk domain)
+  // ---------------------------------------------------------------------------
+  wire hdr_crdt_avail;
+  credit_counter #(.CREDITS(TX_HDR_CREDITS)) u_hdr_crdt (
+    .clk(ucie_clk), .rst_n(ucie_rst_n),
+    .consume(hdr_fire), .ret(ucie_rx_hdr_crdt),
+    .available(hdr_crdt_avail)
+  );
+
+  // Multi-beat burst counters (§4.3)
+  reg [2:0] tx_dat_beat_ctr;
+  wire tx_dat_last = (tx_dat_beat_ctr == 3'd4);
+  wire dat_crdt_avail;
+
+  credit_counter #(.CREDITS(TX_DAT_CREDITS)) u_dat_crdt (
+    .clk(ucie_clk), .rst_n(ucie_rst_n),
+    .consume(data_fire && tx_dat_beat_ctr == 3'd0), .ret(ucie_rx_dat_crdt),
+    .available(dat_crdt_avail)
+  );
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n)
+      tx_dat_beat_ctr <= 3'd0;
+    else if (data_fire)
+      tx_dat_beat_ctr <= tx_dat_last ? 3'd0 : tx_dat_beat_ctr + 3'd1;
+  end
+
+  reg [2:0] rx_dat_beat_ctr;
+  wire rx_dat_last = (rx_dat_beat_ctr == 3'd4);
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n)
+      rx_dat_beat_ctr <= 3'd0;
+    else if (rx_dat_fire)
+      rx_dat_beat_ctr <= rx_dat_last ? 3'd0 : rx_dat_beat_ctr + 3'd1;
+  end
+
+  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
+  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
+  assign ucie_tx_hdr_crdt = rx_hdr_fire;
+  assign ucie_tx_dat_crdt = rx_dat_fire && rx_dat_last;
+
+  wire [LTAG_W-1:0] rx_hdr_tag = ucie_rx_hdr[UCIE_TAG_LSB +: LTAG_W];
+
+  reg [LTAG_W-1:0] rx_dat_tag_latched;
+  always @(posedge ucie_clk) begin
+    if (rx_dat_fire && rx_dat_beat_ctr == 3'd0)
+      rx_dat_tag_latched <= ucie_rx_data[UCIE_TAG_LSB +: LTAG_W];
+  end
+  wire [LTAG_W-1:0] rx_dat_tag = (rx_dat_beat_ctr == 3'd0) ?
+                                 ucie_rx_data[UCIE_TAG_LSB +: LTAG_W] :
+                                 rx_dat_tag_latched;
 
   // ---------------------------------------------------------------------------
   // Transaction table (ucie_clk domain)
@@ -168,46 +225,28 @@ module chi_to_ucie_bridge #(
   // violating valid/ready payload stability. Latch free_tag when a header is
   // first offered; reuse it until the header is accepted.
   reg  [LTAG_W-1:0]   held_tag;
+  reg  [7:0]          held_seq;
   reg                 held_v;
   wire [LTAG_W-1:0]   present_tag = held_v ? held_tag : free_tag;
+  wire [7:0]          present_seq = held_v ? held_seq : flit_seq_ctr;
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n) begin
       held_v   <= 1'b0;
       held_tag <= {LTAG_W{1'b0}};
+      held_seq <= 8'h00;
     end else if (hdr_fire) begin
       held_v   <= 1'b0;
     end else if (ucie_tx_hdr_valid && !ucie_tx_hdr_ready) begin
-      held_tag <= present_tag;
-      held_v   <= 1'b1;
+      if (!held_v) begin
+        held_tag <= present_tag;
+        held_seq <= present_seq;
+        held_v   <= 1'b1;
+      end
     end else if (!ucie_tx_hdr_valid) begin
       held_v   <= 1'b0;
     end
   end
-
-  // ---------------------------------------------------------------------------
-  // UCIe TX credit counters (ucie_clk domain)
-  // ---------------------------------------------------------------------------
-  wire hdr_crdt_avail;
-  credit_counter #(.CREDITS(TX_HDR_CREDITS)) u_hdr_crdt (
-    .clk(ucie_clk), .rst_n(ucie_rst_n),
-    .consume(hdr_fire), .ret(ucie_rx_hdr_crdt),
-    .available(hdr_crdt_avail)
-  );
-
-  wire dat_crdt_avail;
-  credit_counter #(.CREDITS(TX_DAT_CREDITS)) u_dat_crdt (
-    .clk(ucie_clk), .rst_n(ucie_rst_n),
-    .consume(data_fire), .ret(ucie_rx_dat_crdt),
-    .available(dat_crdt_avail)
-  );
-
-  wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
-  wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
-  assign ucie_tx_hdr_crdt = rx_hdr_fire;
-  assign ucie_tx_dat_crdt = rx_dat_fire;
-  wire [LTAG_W-1:0] rx_hdr_tag = ucie_rx_hdr[UCIE_TAG_LSB +: LTAG_W];
-  wire [LTAG_W-1:0] rx_dat_tag = ucie_rx_data[UCIE_DATA_HDR_LSB + UCIE_TAG_LSB +: LTAG_W];
 
   wire [TXNID_W-1:0] a_txnid;
   wire [NODEID_W-1:0] a_srcid;
@@ -232,7 +271,7 @@ module chi_to_ucie_bridge #(
     .full(tbl_full),
     .a_lookup_tag(rx_hdr_tag), .a_free_en(rx_hdr_fire),
     .a_txnid(a_txnid), .a_srcid(a_srcid), .a_is_write(a_is_write), .a_valid(a_valid),
-    .b_lookup_tag(rx_dat_tag), .b_free_en(rx_dat_fire),
+    .b_lookup_tag(rx_dat_tag), .b_free_en(rx_dat_fire && rx_dat_last),
     .b_txnid(b_txnid), .b_srcid(b_srcid), .b_is_write(b_is_write), .b_valid(b_valid),
     .outstanding(outstanding), .tag_err(tbl_tag_err)
   );
@@ -249,7 +288,7 @@ module chi_to_ucie_bridge #(
   wire [LTAG_W-1:0] wq_front = wtag_mem[wq_rptr[WQ_AW-1:0]];
 
   wire wq_push = hdr_fire && req_head_is_write;
-  wire wq_pop  = data_fire;
+  wire wq_pop  = data_fire && tx_dat_last;
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n) begin
@@ -277,6 +316,63 @@ module chi_to_ucie_bridge #(
   end
   // When header and data fire simultaneously, data gets the next sequence number.
   wire [7:0] dat_flit_seq = flit_seq_ctr + {7'h0, hdr_fire};
+
+  reg  [7:0] held_dat_seq;
+  reg        held_dat_v;
+  wire [7:0] present_dat_seq = held_dat_v ? held_dat_seq : dat_flit_seq;
+
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n) begin
+      held_dat_v   <= 1'b0;
+      held_dat_seq <= 8'h00;
+    end else if (data_fire && tx_dat_last) begin
+      held_dat_v   <= 1'b0;
+    end else if (ucie_tx_data_valid && !ucie_tx_data_ready) begin
+      if (!held_dat_v) begin
+        held_dat_seq <= present_dat_seq;
+        held_dat_v   <= 1'b1;
+      end
+    end else if (!ucie_tx_data_valid) begin
+      held_dat_v   <= 1'b0;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // RX data accumulation (§4.3)
+  // ---------------------------------------------------------------------------
+  reg [511:0] rx_dat_accum;
+  reg         rx_dat_poison_latched;
+  reg [UCIE_HDR_W-1:0] rx_hdr_latch;
+
+  always @(posedge ucie_clk) begin
+    if (rx_dat_fire) begin
+      if (rx_dat_beat_ctr == 3'd0) begin
+        rx_dat_poison_latched <= ucie_rx_data[UCIE_ATTR_LSB + 7];
+        rx_hdr_latch          <= ucie_rx_data;
+      end else begin
+        case (rx_dat_beat_ctr)
+          3'd1: rx_dat_accum[0   +: 128] <= ucie_rx_data;
+          3'd2: rx_dat_accum[128 +: 128] <= ucie_rx_data;
+          3'd3: rx_dat_accum[256 +: 128] <= ucie_rx_data;
+          3'd4: rx_dat_accum[384 +: 128] <= ucie_rx_data;
+          default: ;
+        endcase
+      end
+    end
+  end
+
+  // Combinational full 512-bit data for the last beat
+  wire [511:0] rx_dat_full = (rx_dat_beat_ctr == 3'd4) ?
+                             {ucie_rx_data, rx_dat_accum[383:0]} : 512'h0;
+
+  reg [TXNID_W-1:0] rx_dat_txnid_latched;
+  reg               rx_dat_valid_latched;
+  always @(posedge ucie_clk) begin
+    if (rx_dat_fire && rx_dat_beat_ctr == 3'd0) begin
+      rx_dat_txnid_latched <= b_txnid;
+      rx_dat_valid_latched <= b_valid;
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // CHI -> UCIe translation (TX)
@@ -310,34 +406,41 @@ module chi_to_ucie_bridge #(
     input [CHI_DAT_W-1:0] dat;
     input [7:0]           local_tag;
     input [7:0]           flit_seq;
+    input [2:0]           beat;
     reg [UCIE_HDR_W-1:0] hdr;
     begin
-      hdr = pack_ucie_hdr(
-        UCIE_PKT_KIND_AD_REQ,
-        UCIE_MSG_MEM_WR_DATA,
-        local_tag,
-        48'h0000_0000_0000,
-        8'h40,
-        8'h00,
-        dat[CHI_DAT_BE_LSB +: 8],
-        flit_seq
-      );
-      translate_chi_data_to_ucie = {
-        hdr,
-        dat[CHI_DAT_POISON_LSB +: CHI_DAT_POISON_W],
-        dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W]
-      };
+      if (beat == 3'd0) begin
+        hdr = pack_ucie_hdr(
+          UCIE_PKT_KIND_AD_REQ,
+          UCIE_MSG_MEM_WR_DATA,
+          local_tag,
+          48'h0000_0000_0000,
+          8'h40,
+          8'h00,
+          {dat[CHI_DAT_POISON_LSB], 7'b0},
+          flit_seq
+        );
+        translate_chi_data_to_ucie = hdr;
+      end else begin
+        case (beat)
+          3'd1: translate_chi_data_to_ucie = dat[0   +: 128];
+          3'd2: translate_chi_data_to_ucie = dat[128 +: 128];
+          3'd3: translate_chi_data_to_ucie = dat[256 +: 128];
+          3'd4: translate_chi_data_to_ucie = dat[384 +: 128];
+          default: translate_chi_data_to_ucie = 128'h0;
+        endcase
+      end
     end
   endfunction
 
   assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full && hdr_crdt_avail;
   assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag},
-                                                 flit_seq_ctr);
+                                                 present_seq);
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
   assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
-                                                   dat_flit_seq);
+                                                   present_dat_seq, tx_dat_beat_ctr);
   assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 
   // ---------------------------------------------------------------------------
@@ -365,21 +468,21 @@ module chi_to_ucie_bridge #(
   endfunction
 
   function automatic [CHI_DAT_W-1:0] translate_ucie_data_to_chi;
-    input [UCIE_DATA_W-1:0] pkt;
-    input [TXNID_W-1:0]     r_txnid;
-    input                   r_valid;
-    reg [UCIE_HDR_W-1:0] hdr;
+    input [UCIE_HDR_W-1:0] hdr;
+    input [511:0]          data;
+    input                  poison;
+    input [TXNID_W-1:0]    r_txnid;
+    input                  r_valid;
     reg [CHI_DAT_W-1:0] dat;
     reg ok;
     begin
-      hdr = pkt[UCIE_DATA_HDR_LSB +: UCIE_HDR_W];
       ok = ucie_hdr_crc16_ok(hdr) && r_valid &&
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_MEM_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       dat = {CHI_DAT_W{1'b0}};
-      dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W]       = pkt[UCIE_DATA_PAYLOAD_LSB +: DATA_W];
+      dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W]       = data;
       dat[CHI_DAT_BE_LSB +: CHI_DAT_BE_W]           = {BE_W{1'b1}};
-      dat[CHI_DAT_POISON_LSB +: CHI_DAT_POISON_W]   = pkt[UCIE_DATA_POISON_LSB];
+      dat[CHI_DAT_POISON_LSB +: CHI_DAT_POISON_W]   = poison;
       dat[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W]   = 4'h0;
       dat[CHI_DAT_RESPERR_LSB +: CHI_DAT_RESPERR_W] = ok ? CHI_RESPERR_OK : CHI_RESPERR_DERR;
       dat[CHI_DAT_RESP_LSB +: CHI_DAT_RESP_W]       = CHI_CACHE_I;
@@ -390,10 +493,10 @@ module chi_to_ucie_bridge #(
   endfunction
 
   assign ucie_rx_hdr_ready = bridge_open_ucie && !rsp_w_full;
-  assign ucie_rx_data_ready = bridge_open_ucie && !rdat_w_full;
+  assign ucie_rx_data_ready = bridge_open_ucie && (!rdat_w_full || rx_dat_beat_ctr < 3'd4);
 
   wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_crc16_ok(ucie_rx_hdr);
-  wire rx_dat_bad = rx_dat_fire && !ucie_hdr_crc16_ok(ucie_rx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]);
+  wire rx_dat_bad = rx_dat_fire && (rx_dat_beat_ctr == 3'd0) && !ucie_hdr_crc16_ok(ucie_rx_data);
 
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
@@ -403,8 +506,8 @@ module chi_to_ucie_bridge #(
   );
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_rdat_fifo (
-    .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_dat_fire),
-    .w_data(translate_ucie_data_to_chi(ucie_rx_data, b_txnid, b_valid)), .w_full(rdat_w_full),
+    .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_dat_fire && rx_dat_last),
+    .w_data(translate_ucie_data_to_chi(rx_hdr_latch, rx_dat_full, rx_dat_poison_latched, rx_dat_txnid_latched, rx_dat_valid_latched)), .w_full(rdat_w_full),
     .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_comp_data_valid && chi_comp_data_ready),
     .r_data(rdat_r_data), .r_empty(rdat_r_empty)
   );
@@ -447,7 +550,8 @@ module chi_to_ucie_bridge #(
   always @(posedge ucie_clk) begin
     if (ucie_rst_n) begin
       assert (ucie_hdr_crc16_ok(ucie_tx_hdr));
-      assert (ucie_hdr_crc16_ok(ucie_tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W]));
+      if (tx_dat_beat_ctr == 0)
+        assert (ucie_hdr_crc16_ok(ucie_tx_data));
       assert (!ucie_tx_data_valid || !wq_empty);
     end
   end

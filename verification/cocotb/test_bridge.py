@@ -12,7 +12,7 @@ import random
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ReadOnly, ClockCycles
+from cocotb.triggers import RisingEdge, ClockCycles
 
 # ---- CHI REQ flit field map (mirrors chi_ucie_bridge_defs.vh) ----
 CHI_REQ_SIZE_LSB = 6
@@ -27,6 +27,7 @@ CHI_REQ_WRITENOSNPFULL = 0x1D
 # ---- CHI DAT flit field map ----
 CHI_DAT_DATA_LSB = 0
 CHI_DAT_BE_LSB = 512
+CHI_DAT_POISON_LSB = 576
 CHI_DAT_RESPERR_LSB = 581
 CHI_DAT_TXNID_LSB = 586
 CHI_DAT_OPCODE_LSB = 594
@@ -44,6 +45,7 @@ CHI_RSP_COMP = 0x4
 UCIE_KIND_LSB = 124
 UCIE_CODE_LSB = 120
 UCIE_TAG_LSB  = 112
+UCIE_ATTR_LSB = 104
 UCIE_ADDR_LSB = 32   # addr[79:32] — LSB stays 32, width is now 48 bits
 UCIE_HDR_MASK = (1 << 128) - 1
 
@@ -54,10 +56,6 @@ UCIE_MSG_MEM_RD = 0x3
 UCIE_MSG_MEM_WR = 0x4
 UCIE_MSG_MEM_WR_DATA = 0x6
 UCIE_CPL_SC = 0x1
-
-# ---- UCIe data packet positions ----
-UCIE_DATA_POISON_LSB = 512
-UCIE_DATA_HDR_LSB = 513
 
 MASK512 = (1 << 512) - 1
 
@@ -113,16 +111,21 @@ def pack_ucie_hdr(kind, code, tag, addr48=0, length=0, src_id=0, attr=0, flit_se
     return raw | (crc & 0xFFFF)
 
 
-def pack_mem_cpl_data(tag, data):
+def pack_mem_cpl_burst(tag, data, poison=0):
+    """Returns a list of 5 flits (128-bit each) for a MEM_CPL read completion."""
     hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
-                        0x0000_0000_0040, 0x40, 0x55, 0x00, 0x00)
-    return (hdr << UCIE_DATA_HDR_LSB) | ((data & MASK512) << 0)
+                        0x0000_0000_0040, 0x40, 0x55, (poison << 7), 0)
+    flits = [hdr]
+    for i in range(4):
+        flits.append((data >> (128 * i)) & ((1 << 128) - 1))
+    return flits
 
 
-def pack_mem_cpl_data_badcrc(tag, data):
-    """A MEM_CPL packet whose embedded header CRC field is corrupted."""
-    pkt = pack_mem_cpl_data(tag, data)
-    return pkt ^ (0xFFFF << UCIE_DATA_HDR_LSB)  # flip header[15:0] (the crc16)
+def pack_mem_cpl_burst_badcrc(tag, data):
+    """A MEM_CPL burst whose header flit (beat 0) CRC field is corrupted."""
+    flits = pack_mem_cpl_burst(tag, data)
+    flits[0] ^= 0xFFFF  # flip header[15:0] (the crc16)
+    return flits
 
 
 def data_for(addr16):
@@ -271,7 +274,7 @@ async def test_random_traffic(dut):
     async def tx_hdr_consumer():
         while state["running"]:
             dut.ucie_tx_hdr_ready.value = rdy()
-            await ReadOnly()
+            await RisingEdge(dut.ucie_clk)
             if dut.ucie_tx_hdr_ready.value == 1 and dut.ucie_tx_hdr_valid.value == 1:
                 hdr = int(dut.ucie_tx_hdr.value)
                 tag = field(hdr, UCIE_TAG_LSB, 8)
@@ -283,27 +286,35 @@ async def test_random_traffic(dut):
                 if not is_write:
                     # Reads have no data packet; schedule the read completion now.
                     pend_memcpl.append((tag, data_for(addr16)))
-            await RisingEdge(dut.ucie_clk)
 
-    # ---- UCIe TX data consumer: check write-data payload by local tag ----
+    # ---- UCIe TX data consumer: check write-data burst by local tag ----
     async def tx_data_consumer():
+        beat_ctr = 0
+        tag = 0
+        accum = 0
         while state["running"]:
             dut.ucie_tx_data_ready.value = rdy()
-            await ReadOnly()
-            if dut.ucie_tx_data_ready.value == 1 and dut.ucie_tx_data_valid.value == 1:
-                pkt = int(dut.ucie_tx_data.value)
-                hdr = (pkt >> UCIE_DATA_HDR_LSB) & UCIE_HDR_MASK
-                tag = field(hdr, UCIE_TAG_LSB, 8)
-                payload = pkt & MASK512
-                info = tag_info.get(tag)
-                if info is None:
-                    sb.errors.append(f"write data for unknown tag {tag}")
-                elif payload != data_for(info["addr16"]):
-                    sb.errors.append(f"write data payload mismatch tag {tag}")
-                else:
-                    # Write data received: now the far side can complete it.
-                    pend_adcpl.append(tag)
             await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_data_ready.value == 1 and dut.ucie_tx_data_valid.value == 1:
+                val = int(dut.ucie_tx_data.value)
+                if beat_ctr == 0:
+                    tag = field(val, UCIE_TAG_LSB, 8)
+                    accum = 0
+                else:
+                    accum |= (val << (128 * (beat_ctr - 1)))
+
+                if beat_ctr == 4:
+                    info = tag_info.get(tag)
+                    if info is None:
+                        sb.errors.append(f"write data for unknown tag {tag}")
+                    elif accum != data_for(info["addr16"]):
+                        sb.errors.append(f"write data payload mismatch tag {tag}")
+                    else:
+                        # Write data received: now the far side can complete it.
+                        pend_adcpl.append(tag)
+                    beat_ctr = 0
+                else:
+                    beat_ctr += 1
 
     # ---- UCIe RX header driver: return AD_CPL (write completions), out of order ----
     async def rx_hdr_driver():
@@ -316,10 +327,9 @@ async def test_random_traffic(dut):
                 dut.ucie_rx_hdr_valid.value = 1
             else:
                 dut.ucie_rx_hdr_valid.value = 0
-            await ReadOnly()
-            took = chosen is not None and dut.ucie_rx_hdr_ready.value == 1
+            
             await RisingEdge(dut.ucie_clk)
-            if took:
+            if chosen is not None and dut.ucie_rx_hdr_ready.value == 1:
                 pend_adcpl.remove(chosen)
                 pend_hdr_crdts[0] += 1  # write consumed 1 hdr credit
                 pend_dat_crdts[0] += 1  # write consumed 1 dat credit
@@ -330,16 +340,20 @@ async def test_random_traffic(dut):
             chosen = None
             if pend_memcpl and random.random() < 0.6:
                 chosen = random.choice(pend_memcpl)
-                dut.ucie_rx_data.value = pack_mem_cpl_data(chosen[0], chosen[1])
-                dut.ucie_rx_data_valid.value = 1
+                flits = pack_mem_cpl_burst(chosen[0], chosen[1])
+                for flit in flits:
+                    dut.ucie_rx_data.value = flit
+                    dut.ucie_rx_data_valid.value = 1
+                    while True:
+                        await RisingEdge(dut.ucie_clk)
+                        if dut.ucie_rx_data_ready.value == 1:
+                            break
+                dut.ucie_rx_data_valid.value = 0
+                pend_memcpl.remove(chosen)
+                pend_hdr_crdts[0] += 1  # read burst consumed 1 hdr credit
             else:
                 dut.ucie_rx_data_valid.value = 0
-            await ReadOnly()
-            took = chosen is not None and dut.ucie_rx_data_ready.value == 1
-            await RisingEdge(dut.ucie_clk)
-            if took:
-                pend_memcpl.remove(chosen)
-                pend_hdr_crdts[0] += 1  # read consumed 1 hdr credit
+                await RisingEdge(dut.ucie_clk)
 
     # ---- Credit returners: pulse ucie_rx_hdr/dat_crdt when credits are due ----
     async def hdr_crdt_returner():
@@ -364,7 +378,7 @@ async def test_random_traffic(dut):
     async def chi_rsp_sink():
         while state["running"]:
             dut.chi_rsp_ready.value = rdy()
-            await ReadOnly()
+            await RisingEdge(dut.clk)
             if dut.chi_rsp_ready.value == 1 and dut.chi_rsp_valid.value == 1:
                 rsp = int(dut.chi_rsp_data.value)
                 assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_COMP
@@ -372,13 +386,12 @@ async def test_random_traffic(dut):
                 sb.complete_write(txnid)
                 cov_cpl.hit("comp")
                 inuse.discard(txnid)
-            await RisingEdge(dut.clk)
 
     # ---- CHI CompData sink: read completions ----
     async def chi_comp_sink():
         while state["running"]:
             dut.chi_comp_data_ready.value = rdy()
-            await ReadOnly()
+            await RisingEdge(dut.clk)
             if dut.chi_comp_data_ready.value == 1 and dut.chi_comp_data_valid.value == 1:
                 dat = int(dut.chi_comp_data.value)
                 assert field(dat, CHI_DAT_OPCODE_LSB, 4) == CHI_DAT_COMPDATA
@@ -387,7 +400,6 @@ async def test_random_traffic(dut):
                 sb.complete_read(txnid, data)
                 cov_cpl.hit("compdata")
                 inuse.discard(txnid)
-            await RisingEdge(dut.clk)
 
     for c in (tx_hdr_consumer, tx_data_consumer, rx_hdr_driver, rx_data_driver,
               chi_rsp_sink, chi_comp_sink, hdr_crdt_returner, dat_crdt_returner):
@@ -452,12 +464,7 @@ async def test_random_traffic(dut):
 
 @cocotb.test(timeout_time=2, timeout_unit="ms")
 async def test_random_errors(dut):
-    """Randomized read stream with corrupted-checksum completions.
-
-    The far side randomly returns MEM_CPL packets with a bad header checksum.
-    The bridge must still complete each read (freeing the tag) but flag RespErr,
-    and crc_err_cnt must equal the number of corrupted completions delivered.
-    """
+    """Randomized read stream with corrupted-checksum completions."""
     random.seed(0x5EED5)
     await reset_and_open(dut)
 
@@ -482,7 +489,7 @@ async def test_random_errors(dut):
     async def tx_hdr_consumer():
         while st["running"]:
             dut.ucie_tx_hdr_ready.value = rdy()
-            await ReadOnly()
+            await RisingEdge(dut.ucie_clk)
             if dut.ucie_tx_hdr_ready.value == 1 and dut.ucie_tx_hdr_valid.value == 1:
                 hdr = int(dut.ucie_tx_hdr.value)
                 tag = field(hdr, UCIE_TAG_LSB, 8)
@@ -492,7 +499,6 @@ async def test_random_errors(dut):
                     st["n_corrupt"] += 1
                 cov_csum.hit("bad" if corrupt else "good")
                 pend.append((tag, data_for(addr16), corrupt))
-            await RisingEdge(dut.ucie_clk)
 
     async def rx_data_driver():
         while st["running"]:
@@ -500,18 +506,21 @@ async def test_random_errors(dut):
             if pend and random.random() < 0.6:
                 chosen = random.choice(pend)
                 tag, data, corrupt = chosen
-                pkt = pack_mem_cpl_data_badcrc(tag, data) if corrupt \
-                    else pack_mem_cpl_data(tag, data)
-                dut.ucie_rx_data.value = pkt
-                dut.ucie_rx_data_valid.value = 1
+                flits = pack_mem_cpl_burst_badcrc(tag, data) if corrupt \
+                    else pack_mem_cpl_burst(tag, data)
+                for flit in flits:
+                    dut.ucie_rx_data.value = flit
+                    dut.ucie_rx_data_valid.value = 1
+                    while True:
+                        await RisingEdge(dut.ucie_clk)
+                        if dut.ucie_rx_data_ready.value == 1:
+                            break
+                dut.ucie_rx_data_valid.value = 0
+                pend.remove(chosen)
+                pend_hdr_crdts[0] += 1
             else:
                 dut.ucie_rx_data_valid.value = 0
-            await ReadOnly()
-            took = chosen is not None and dut.ucie_rx_data_ready.value == 1
-            await RisingEdge(dut.ucie_clk)
-            if took:
-                pend.remove(chosen)
-                pend_hdr_crdts[0] += 1  # read consumed 1 hdr credit
+                await RisingEdge(dut.ucie_clk)
 
     async def hdr_crdt_returner():
         while st["running"]:
@@ -525,7 +534,7 @@ async def test_random_errors(dut):
     async def chi_comp_sink():
         while st["running"]:
             dut.chi_comp_data_ready.value = rdy()
-            await ReadOnly()
+            await RisingEdge(dut.clk)
             if dut.chi_comp_data_ready.value == 1 and dut.chi_comp_data_valid.value == 1:
                 dat = int(dut.chi_comp_data.value)
                 txnid = field(dat, CHI_DAT_TXNID_LSB, 8)
@@ -546,7 +555,6 @@ async def test_random_errors(dut):
                     st["errors"].append(f"unexpected RespErr {resperr}")
                 st["done"] += 1
                 inuse.discard(txnid)
-            await RisingEdge(dut.clk)
 
     for c in (tx_hdr_consumer, rx_data_driver, hdr_crdt_returner, chi_comp_sink):
         cocotb.start_soon(c())

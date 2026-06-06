@@ -17,6 +17,7 @@ module chi_to_ucie_bridge_sva (
   input wire                   tx_data_valid,
   input wire                   tx_data_ready,
   input wire [UCIE_DATA_W-1:0] tx_data,
+  input wire [2:0]             tx_dat_beat_ctr,
   input wire                   wq_empty,
   // CHI host clock domain (output completion channels)
   input wire                   clk_chi,    // clk
@@ -39,11 +40,11 @@ module chi_to_ucie_bridge_sva (
     (tx_hdr_valid && tx_hdr_ready) |-> ucie_hdr_crc16_ok(tx_hdr)
   );
 
-  // The header embedded in an issued write-data packet also checks.
+  // The header flit (beat 0) of an issued write-data burst also checks.
   a_tx_data_csum: assert property (
     @(posedge clk) disable iff (!rst_n)
-    (tx_data_valid && tx_data_ready) |->
-      ucie_hdr_crc16_ok(tx_data[UCIE_DATA_HDR_LSB +: UCIE_HDR_W])
+    (tx_data_valid && tx_data_ready && tx_dat_beat_ctr == 0) |->
+      ucie_hdr_crc16_ok(tx_data)
   );
 
   // Handshake persistence: while the link stays open, a stalled TX header keeps
@@ -109,6 +110,7 @@ bind chi_to_ucie_bridge chi_to_ucie_bridge_sva u_sva (
   .tx_data_valid(ucie_tx_data_valid),
   .tx_data_ready(ucie_tx_data_ready),
   .tx_data(ucie_tx_data),
+  .tx_dat_beat_ctr(tx_dat_beat_ctr),
   .wq_empty(wq_empty),
   .clk_chi(clk),
   .rst_chi(clk_rst_n),
