@@ -77,4 +77,39 @@ class chi_item extends uvm_sequence_item;
     return flit;
   endfunction
 
+  // Unpack from bitstream
+  function void unpack_flit(logic [CHI_DAT_W-1:0] flit, item_type_e t);
+    this.item_type = t;
+    case (item_type)
+      REQ: begin
+        order      = flit[0 +: 2];
+        memattr    = flit[2 +: 4];
+        size       = flit[6 +: 3];
+        addr       = flit[9 +: 48];
+        req_opcode = chi_req_opcode_e'(flit[57 +: 7]);
+        txnid      = flit[64 +: 8];
+        srcid      = flit[72 +: 7];
+        tgtid      = flit[79 +: 7];
+        qos        = flit[86 +: 4];
+      end
+      RSP: begin
+        resperr    = chi_resperr_e'(flit[0 +: 2]);
+        dbid       = flit[2 +: 4];
+        txnid      = flit[6 +: 8];
+        rsp_opcode = chi_rsp_opcode_e'(flit[14 +: 4]);
+        srcid      = flit[18 +: 7];
+      end
+      DAT: begin
+        data        = flit[0   +: 512];
+        be          = flit[512 +: 64];
+        poison      = flit[576 +: 1];
+        dataid      = flit[577 +: 4];
+        dat_resperr = chi_resperr_e'(flit[581 +: 2]);
+        resp        = chi_cache_state_e'(flit[583 +: 3]);
+        txnid       = flit[586 +: 8];
+        dat_opcode  = chi_dat_opcode_e'(flit[594 +: 4]);
+      end
+    endcase
+  endfunction
+
 endclass

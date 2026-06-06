@@ -63,9 +63,9 @@ package chi_ucie_uvm_pkg;
   localparam int NODEID_W        = 7;
   localparam int UCIE_HDR_W      = 128;
 
-  localparam int CHI_REQ_W       = 79; // From defs.vh: QOS_LSB(75) + QOS_W(4)
-  localparam int CHI_RSP_W       = 25; // From defs.vh: SRCID_LSB(18) + SRCID_W(7)
-  localparam int CHI_DAT_W       = 602; // From defs.vh: OPCODE_LSB(598) + OPCODE_W(4)
+  localparam int CHI_REQ_W       = 90;
+  localparam int CHI_RSP_W       = 25;
+  localparam int CHI_DAT_W       = 598;
 
   // Forward declarations for includes
   typedef class chi_item;
@@ -74,5 +74,20 @@ package chi_ucie_uvm_pkg;
   // Includes for components
   `include "chi_item.sv"
   `include "ucie_item.sv"
+  `include "chi_sequencer.sv"
+  `include "chi_driver.sv"
+  `include "chi_monitor.sv"
+  `include "chi_agent.sv"
+  `include "ucie_sequencer.sv"
+  `include "ucie_driver.sv"
+  `include "ucie_monitor.sv"
+  `include "ucie_agent.sv"
+  `include "chi_ucie_scoreboard.sv"
+  `include "chi_ucie_env.sv"
+  `include "chi_base_seq.sv"
+  `include "chi_read_write_seq.sv"
+  `include "ucie_completion_seq.sv"
+  `include "base_test.sv"
+  `include "read_write_test.sv"
 
 endpackage

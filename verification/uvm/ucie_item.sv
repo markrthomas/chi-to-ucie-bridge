@@ -5,7 +5,7 @@ class ucie_item extends uvm_sequence_item;
 
   // Header Fields
   rand ucie_pkt_kind_e    kind;
-  rand ucie_msg_code_e    code;
+  rand logic [3:0]        code;  // ucie_msg_code_e for requests; ucie_cpl_status_e for completions
   rand logic [7:0]        tag;
   rand logic [ADDR_W-1:0] addr;
   rand logic [7:0]        length;
@@ -27,7 +27,13 @@ class ucie_item extends uvm_sequence_item;
     super.new(name);
   endfunction
 
-  // Pack header into 128-bit flit
+  // XOR CRC16 over slices [127:16] with CRC field zeroed
+  local function logic [15:0] crc16(logic [127:0] h);
+    return h[127:112] ^ h[111:96] ^ h[95:80] ^ h[79:64] ^
+           h[63:48]   ^ h[47:32]  ^ h[31:16];
+  endfunction
+
+  // Pack header into 128-bit flit (CRC16 computed and inserted)
   function logic [UCIE_HDR_W-1:0] pack_hdr();
     logic [UCIE_HDR_W-1:0] hdr = '0;
     hdr[127:124] = kind;
@@ -38,7 +44,7 @@ class ucie_item extends uvm_sequence_item;
     hdr[95:88]   = src_id;
     hdr[87:80]   = flit_seq;
     hdr[79:32]   = addr;
-    // CRC is computed by the bridge/driver
+    hdr[15:0]    = crc16(hdr);   // [31:16] reserved = 0, so CRC covers all meaningful fields
     return hdr;
   endfunction
 
@@ -46,6 +52,25 @@ class ucie_item extends uvm_sequence_item;
   function void pack_data_beats(output logic [UCIE_HDR_W-1:0] beats[4]);
     for (int i=0; i<4; i++) begin
       beats[i] = data[i*128 +: 128];
+    end
+  endfunction
+
+  // Unpack header from 128-bit flit
+  function void unpack_hdr(logic [UCIE_HDR_W-1:0] hdr);
+    kind     = ucie_pkt_kind_e'(hdr[127:124]);
+    code     = hdr[123:120];
+    tag      = hdr[119:112];
+    attr     = hdr[111:104];
+    length   = hdr[103:96];
+    src_id   = hdr[95:88];
+    flit_seq = hdr[87:80];
+    addr     = hdr[79:32];
+  endfunction
+
+  // Unpack data from 4 flits
+  function void unpack_data_beats(logic [UCIE_HDR_W-1:0] beats[4]);
+    for (int i=0; i<4; i++) begin
+      data[i*128 +: 128] = beats[i];
     end
   endfunction
 
