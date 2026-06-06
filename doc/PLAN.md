@@ -272,3 +272,30 @@ a 5-beat sequence on the data channel (ucie_tx_data / ucie_rx_data).
 - cocotb and formal verification updated to match the new protocol.
 
 ### 4.4 integration hooks for a UCIe PHY/link-training block (planned)
+
+## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
+
+Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
+
+**Components**
+
+| File | Role |
+|:---|:---|
+| `chi_if.sv` / `ucie_if.sv` | Clocking-block interfaces (drv_cb + mon_cb) |
+| `chi_agent/ucie_agent` | Active agents: sequencer + driver + monitor |
+| `chi_ucie_scoreboard` | End-to-end tag-tracking and address translation checks |
+| `chi_ucie_env` | Creates agents, scoreboard, and `cpl_mbox` mailbox |
+| `read_write_test` | Runs randomised CHI read/write mix + reactive UCIe completions |
+
+**Key design decisions**
+
+- **Atomic write drive**: bridge requires `chi_req_valid` and `chi_wr_data_valid`
+  simultaneously; `chi_base_seq::send_write` packs both into one item; `chi_driver`
+  drives both channels until both ready signals assert.
+- **Reactive completions via mailbox**: scoreboard fills `cpl_mbox` (AD_CPL for
+  writes, MEM_CPL for reads) on each observed UCIe TX_HDR; `ucie_completion_seq`
+  pops and drives completions with a 20 ns turn-around.
+- **CRC16 in `pack_hdr`**: `ucie_item::pack_hdr()` computes and inserts the XOR
+  CRC16 field so the bridge accepts all RX completions without marking DERR.
+- **Credit return**: `ucie_driver` pulses `rx_hdr_crdt` (and `rx_dat_crdt` for
+  AD_CPL) for one cycle after each accepted completion to prevent TX stalls.
