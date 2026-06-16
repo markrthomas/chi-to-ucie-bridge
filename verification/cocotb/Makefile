@@ -34,6 +34,7 @@ VERILOG_SOURCES := \
 	$(SRC_DIR)/credit_counter.v \
 	$(SRC_DIR)/credit_pulse_sync.v \
 	$(SRC_DIR)/txn_table.v \
+	$(SRC_DIR)/phy_link_ctrl.v \
 	$(SRC_DIR)/chi_to_ucie_bridge.v
 
 TOPLEVEL := chi_to_ucie_bridge

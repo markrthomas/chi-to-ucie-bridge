@@ -124,6 +124,11 @@ localparam [3:0] UCIE_CPL_SC           = 4'h1;
 localparam [3:0] UCIE_CPL_UR           = 4'h2;
 localparam [3:0] UCIE_CPL_CA           = 4'h3;
 
+// ---- UCIe sideband management message codes (§4.4) ----
+localparam [7:0] SB_MSG_LINK_ACTIVE  = 8'hA0;  // bridge entered link-active state
+localparam [7:0] SB_MSG_LINK_ERROR   = 8'hE1;  // bridge detected link error
+localparam [7:0] SB_MSG_RETRAIN_REQ  = 8'hC2;  // bridge requesting PHY retrain
+
 // ---- UCIe 128-bit header field positions ----
 localparam integer UCIE_KIND_MSB  = 127;
 localparam integer UCIE_KIND_LSB  = 124;

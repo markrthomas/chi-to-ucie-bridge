@@ -271,7 +271,42 @@ a 5-beat sequence on the data channel (ucie_tx_data / ucie_rx_data).
 - Stability latches added for flit_seq_ctr to ensure stalled headers remain valid.
 - cocotb and formal verification updated to match the new protocol.
 
-### 4.4 integration hooks for a UCIe PHY/link-training block (planned)
+### 4.4 PHY/link-training integration hooks (done)
+
+Replaced the single `link_up` input with a proper PHY interface and added a
+4-state link controller:
+
+**New module** `src/phy_link_ctrl.v`:
+
+| State | Encoding | Notes |
+|:---|:---|:---|
+| `S_WAIT_PHY`  | 2'b00 | waiting for `phy_init_done` |
+| `S_ACTIVE`    | 2'b01 | drives `link_up=1` into `reset_drain` |
+| `S_ERR_DRAIN` | 2'b10 | error detected; draining outstanding transactions |
+| `S_RETRAIN`   | 2'b11 | drain complete; `retrain_req=1` until PHY re-initiates |
+
+Normal bring-up: `S_WAIT_PHY` → `S_ACTIVE` on `phy_init_done`.  
+Normal tear-down: `S_ACTIVE` → `S_WAIT_PHY` on `!phy_init_done` (no error).  
+Error recovery: `S_ACTIVE` → `S_ERR_DRAIN` on `link_error`, → `S_RETRAIN`
+on `drain_done`, → `S_ACTIVE` on `phy_init_done && !link_error`.
+
+**New bridge ports** (`src/chi_to_ucie_bridge.v`):
+- `phy_init_done` (input) — replaces `link_up`; synchronized into clk domain
+- `link_error` (input) — PHY signals unrecoverable error (clk domain)
+- `retrain_req` (output) — bridge requests PHY to retrain
+- `link_state[1:0]` (output) — observable FSM state
+- `sb_tx_valid` / `sb_tx_data[7:0]` / `sb_tx_ready` — sideband TX
+- `sb_rx_valid` / `sb_rx_data[7:0]` / `sb_rx_ready` — sideband RX (always ready)
+
+**Sideband TX**: one pending message per link-state transition. Defined in
+`chi_ucie_bridge_defs.vh`: `SB_MSG_LINK_ACTIVE=0xA0`, `SB_MSG_LINK_ERROR=0xE1`,
+`SB_MSG_RETRAIN_REQ=0xC2`. Bridge sends one message on each state entry.
+
+**Formal**: new `phy_link_ctrl.sby` target (depth 8) added alongside the three
+existing targets; all 4 formal targets pass at depth 8. `phy_link_ctrl` proves:
+`link_up` and `retrain_req` are mutually exclusive, `retrain_req` only fires
+after passing through `S_ERR_DRAIN`, error in `S_ACTIVE` deasserts `link_up`
+next cycle, full error-recovery cycle is reachable.
 
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 

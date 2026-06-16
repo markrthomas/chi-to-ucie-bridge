@@ -12,6 +12,7 @@ SOURCES := $(SRC_DIR)/async_fifo.v \
            $(SRC_DIR)/credit_counter.v \
            $(SRC_DIR)/credit_pulse_sync.v \
            $(SRC_DIR)/txn_table.v \
+           $(SRC_DIR)/phy_link_ctrl.v \
            $(SRC_DIR)/chi_to_ucie_bridge.v \
            $(SRC_DIR)/chi_to_ucie_bridge_chk.v \
            $(SRC_DIR)/tb_chi_to_ucie_bridge.v
@@ -44,7 +45,8 @@ $(BUILD_DIR):
 lint:
 	cd ../.. && verilator -Isrc --lint-only -Wall -top-module chi_to_ucie_bridge \
 		src/async_fifo.v src/cdc_sync.v src/reset_sync.v src/reset_drain.v \
-		src/credit_counter.v src/credit_pulse_sync.v src/txn_table.v src/chi_to_ucie_bridge.v \
+		src/credit_counter.v src/credit_pulse_sync.v src/txn_table.v src/phy_link_ctrl.v \
+		src/chi_to_ucie_bridge.v \
 		-Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-fatal
 
 clean:

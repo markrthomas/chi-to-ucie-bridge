@@ -139,7 +139,11 @@ def data_for(addr16):
 
 async def reset_and_open(dut):
     dut.rst_n.value = 0
-    dut.link_up.value = 0
+    dut.phy_init_done.value = 0
+    dut.link_error.value = 0
+    dut.sb_tx_ready.value = 1
+    dut.sb_rx_valid.value = 0
+    dut.sb_rx_data.value = 0
     dut.err_inj_en.value = 0
     dut.chi_req_valid.value = 0
     dut.chi_req_data.value = 0
@@ -161,7 +165,7 @@ async def reset_and_open(dut):
 
     await ClockCycles(dut.clk, 8)
     dut.rst_n.value = 1
-    dut.link_up.value = 1
+    dut.phy_init_done.value = 1
     await ClockCycles(dut.clk, 16)
 
 

@@ -26,8 +26,19 @@ interface ucie_if (input logic clk, input logic rst_n);
   logic               tx_hdr_crdt;
   logic               tx_dat_crdt;
 
-  // Status
-  logic               link_up;
+  // PHY hooks (§4.4)
+  logic               phy_init_done;
+  logic               link_error;
+  logic               retrain_req;
+  logic [1:0]         link_state;
+
+  // Sideband (§4.4)
+  logic               sb_tx_valid;
+  logic [7:0]         sb_tx_data;
+  logic               sb_tx_ready;
+  logic               sb_rx_valid;
+  logic [7:0]         sb_rx_data;
+  logic               sb_rx_ready;
 
   // Driver clocking block
   clocking drv_cb @(posedge clk);
@@ -42,7 +53,10 @@ interface ucie_if (input logic clk, input logic rst_n);
     input  rx_data_ready;
     output rx_hdr_crdt, rx_dat_crdt;
     input  tx_hdr_crdt, tx_dat_crdt;
-    output link_up;
+    output phy_init_done, link_error;
+    input  retrain_req, link_state;
+    output sb_tx_ready, sb_rx_valid, sb_rx_data;
+    input  sb_tx_valid, sb_tx_data;
   endclocking
 
   // Monitor clocking block
@@ -53,7 +67,8 @@ interface ucie_if (input logic clk, input logic rst_n);
     input rx_hdr_valid, rx_hdr, rx_hdr_ready;
     input rx_data_valid, rx_data, rx_data_ready;
     input rx_hdr_crdt, rx_dat_crdt, tx_hdr_crdt, tx_dat_crdt;
-    input link_up;
+    input phy_init_done, link_error, retrain_req, link_state;
+    input sb_tx_valid, sb_tx_data, sb_tx_ready;
   endclocking
 
   modport driver (clocking drv_cb, input clk, rst_n);

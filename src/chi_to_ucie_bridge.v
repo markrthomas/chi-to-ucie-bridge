@@ -8,6 +8,11 @@
 //
 // Phase 4.3: multi-beat data support. 512-bit data bursts are split into 4 beats
 // of 128-bit data, preceded by a 128-bit header flit (5 beats total).
+//
+// Phase 4.4: PHY/link-training integration hooks. phy_link_ctrl manages the
+// link-state FSM (WAIT_PHY -> ACTIVE -> ERR_DRAIN -> RETRAIN) and drives the
+// internal link_up into reset_drain. A minimal sideband TX/RX interface allows
+// the PHY block to exchange management messages with the bridge.
 
 `include "chi_ucie_bridge_defs.vh"
 
@@ -58,7 +63,20 @@ module chi_to_ucie_bridge #(
   output wire                     ucie_tx_hdr_crdt,
   output wire                     ucie_tx_dat_crdt,
 
-  input  wire                     link_up,
+  // PHY integration hooks (§4.4)
+  input  wire                     phy_init_done,
+  input  wire                     link_error,
+  output wire                     retrain_req,
+  output wire [1:0]               link_state,
+
+  // Sideband interface (§4.4)
+  output wire                     sb_tx_valid,
+  output wire [7:0]               sb_tx_data,
+  input  wire                     sb_tx_ready,
+  input  wire                     sb_rx_valid,
+  input  wire [7:0]               sb_rx_data,
+  output wire                     sb_rx_ready,
+
   input  wire                     err_inj_en,
   output wire                     drain_done,
   output reg  [15:0]              crc_err_cnt,
@@ -80,9 +98,12 @@ module chi_to_ucie_bridge #(
     .clk(ucie_clk), .async_rst_n(rst_n), .sync_rst_n(ucie_rst_n)
   );
 
+  // Synchronise phy_init_done into the clk domain for phy_link_ctrl.
+  // link_error is assumed to originate in the clk domain from the system
+  // link-training block; add a sync stage here if the PHY is on a separate clock.
   wire link_up_clk;
   cdc_sync #(.STAGES(2)) u_link_up_cdc (
-    .clk(clk), .rst_n(clk_rst_n), .d(link_up), .q(link_up_clk)
+    .clk(clk), .rst_n(clk_rst_n), .d(phy_init_done), .q(link_up_clk)
   );
 
   wire req_w_full;
@@ -132,15 +153,65 @@ module chi_to_ucie_bridge #(
   );
 
   wire all_empty = req_r_empty_clk && wdat_r_empty_clk && rsp_r_empty && rdat_r_empty;
+
+  // PHY link controller: translates phy_init_done / link_error into the
+  // reset_drain link_up signal, and sequences the error-recovery retrain flow.
+  // Operates in the clk domain alongside reset_drain.
+  wire link_up_internal;
+  phy_link_ctrl u_phy_ctrl (
+    .clk(clk), .rst_n(clk_rst_n),
+    .phy_init_done(link_up_clk),  // CDC-synchronised PHY ready
+    .link_error(link_error),
+    .drain_done(drain_done),
+    .link_up(link_up_internal),
+    .retrain_req(retrain_req),
+    .link_state(link_state)
+  );
+
   wire bridge_open;
   reset_drain u_reset_drain (
     .clk(clk),
     .rst_n(clk_rst_n),
-    .link_up(link_up_clk),
+    .link_up(link_up_internal),
     .all_empty(all_empty),
     .open(bridge_open),
     .drain_done(drain_done)
   );
+
+  // Sideband TX: send one management message per link-state transition.
+  // One pending message at a time; newer events overwrite a queued message.
+  localparam [1:0] PLC_WAIT    = 2'b00;
+  localparam [1:0] PLC_ACTIVE  = 2'b01;
+  localparam [1:0] PLC_ERR_DRN = 2'b10;
+  localparam [1:0] PLC_RETRAIN = 2'b11;
+
+  reg        sb_pending;
+  reg [7:0]  sb_msg_r;
+  reg [1:0]  link_state_q;
+
+  always @(posedge clk or negedge clk_rst_n) begin
+    if (!clk_rst_n) begin
+      sb_pending    <= 1'b0;
+      sb_msg_r      <= 8'h00;
+      link_state_q  <= PLC_WAIT;
+    end else begin
+      link_state_q <= link_state;
+      if (link_state == PLC_ERR_DRN && link_state_q != PLC_ERR_DRN) begin
+        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_LINK_ERROR;
+      end else if (link_state == PLC_RETRAIN && link_state_q != PLC_RETRAIN) begin
+        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_RETRAIN_REQ;
+      end else if (link_state == PLC_ACTIVE && link_state_q != PLC_ACTIVE) begin
+        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_LINK_ACTIVE;
+      end else if (sb_tx_valid && sb_tx_ready) begin
+        sb_pending <= 1'b0;
+      end
+    end
+  end
+
+  assign sb_tx_valid = sb_pending;
+  assign sb_tx_data  = sb_msg_r;
+  // Sideband RX: always accept; management message contents are for the PHY block.
+  assign sb_rx_ready = 1'b1;
 
   wire bridge_open_ucie;
   cdc_sync #(.STAGES(2)) u_open_cdc (

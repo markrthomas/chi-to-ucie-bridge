@@ -47,7 +47,16 @@ module tb_chi_to_ucie_bridge;
   wire        ucie_tx_hdr_crdt;
   wire        ucie_tx_dat_crdt;
 
-  reg         link_up;
+  reg         phy_init_done;
+  reg         link_error;
+  wire        retrain_req;
+  wire [1:0]  link_state;
+  wire        sb_tx_valid;
+  wire [7:0]  sb_tx_data;
+  reg         sb_tx_ready;
+  reg         sb_rx_valid;
+  reg  [7:0]  sb_rx_data;
+  wire        sb_rx_ready;
   reg         err_inj_en;
   wire        drain_done;
   wire [15:0] crc_err_cnt;
@@ -94,7 +103,16 @@ module tb_chi_to_ucie_bridge;
     .ucie_rx_dat_crdt(ucie_rx_dat_crdt),
     .ucie_tx_hdr_crdt(ucie_tx_hdr_crdt),
     .ucie_tx_dat_crdt(ucie_tx_dat_crdt),
-    .link_up(link_up),
+    .phy_init_done(phy_init_done),
+    .link_error(link_error),
+    .retrain_req(retrain_req),
+    .link_state(link_state),
+    .sb_tx_valid(sb_tx_valid),
+    .sb_tx_data(sb_tx_data),
+    .sb_tx_ready(sb_tx_ready),
+    .sb_rx_valid(sb_rx_valid),
+    .sb_rx_data(sb_rx_data),
+    .sb_rx_ready(sb_rx_ready),
     .err_inj_en(err_inj_en),
     .drain_done(drain_done),
     .crc_err_cnt(crc_err_cnt),
@@ -133,11 +151,15 @@ module tb_chi_to_ucie_bridge;
       ucie_rx_data = {UCIE_DATA_W{1'b0}};
       ucie_rx_hdr_crdt = 1'b0;
       ucie_rx_dat_crdt = 1'b0;
-      link_up = 1'b0;
+      phy_init_done = 1'b0;
+      link_error    = 1'b0;
+      sb_tx_ready   = 1'b1;
+      sb_rx_valid   = 1'b0;
+      sb_rx_data    = 8'h00;
       err_inj_en = 1'b0;
       repeat (8) @(posedge clk);
       rst_n = 1'b1;
-      link_up = 1'b1;
+      phy_init_done = 1'b1;
       repeat (8) @(posedge clk);
       repeat (4) @(posedge ucie_clk);
     end

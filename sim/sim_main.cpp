@@ -51,7 +51,11 @@ int main(int argc, char** argv) {
     zero_wide(dut->ucie_rx_data, 19);
     dut->ucie_rx_hdr_crdt = 0;
     dut->ucie_rx_dat_crdt = 0;
-    dut->link_up = 0;
+    dut->phy_init_done = 0;
+    dut->link_error = 0;
+    dut->sb_tx_ready = 1;
+    dut->sb_rx_valid = 0;
+    dut->sb_rx_data = 0;
     dut->err_inj_en = 0;
     dut->eval();
 
@@ -74,11 +78,11 @@ int main(int argc, char** argv) {
         dut->ucie_clk = ucie_clk;
 
         if (clk_cycles >= 8) dut->rst_n = 1;
-        if (clk_cycles >= 16) dut->link_up = 1;
+        if (clk_cycles >= 16) dut->phy_init_done = 1;
         if (clk_cycles >= 80 && clk_cycles < 100) dut->ucie_tx_hdr_ready = 0;
         else dut->ucie_tx_hdr_ready = 1;
-        if (clk_cycles >= 120 && clk_cycles < 132) dut->link_up = 0;
-        if (clk_cycles >= 132) dut->link_up = 1;
+        if (clk_cycles >= 120 && clk_cycles < 132) dut->phy_init_done = 0;
+        if (clk_cycles >= 132) dut->phy_init_done = 1;
 
         dut->eval();
 

@@ -1,0 +1,13 @@
+[options]
+mode bmc
+depth 8
+
+[engines]
+smtbmc
+
+[script]
+read_verilog -formal phy_link_ctrl.v
+prep -top phy_link_ctrl
+
+[files]
+../../src/phy_link_ctrl.v

@@ -34,9 +34,13 @@ class ucie_driver extends uvm_driver #(ucie_item);
     vif.drv_cb.rx_dat_crdt   <= 1'b0;
     vif.drv_cb.tx_hdr_ready  <= 1'b1;
     vif.drv_cb.tx_data_ready <= 1'b1;
-    vif.drv_cb.link_up       <= 1'b0;
+    vif.drv_cb.phy_init_done <= 1'b0;
+    vif.drv_cb.link_error    <= 1'b0;
+    vif.drv_cb.sb_tx_ready   <= 1'b1;
+    vif.drv_cb.sb_rx_valid   <= 1'b0;
+    vif.drv_cb.sb_rx_data    <= 8'h00;
     wait (vif.rst_n === 1'b1);
-    vif.drv_cb.link_up       <= 1'b1;
+    vif.drv_cb.phy_init_done <= 1'b1;
   endtask
 
   local task backpressure_handler();
