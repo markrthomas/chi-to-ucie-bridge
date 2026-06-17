@@ -452,25 +452,25 @@ completion (size=5 read, `b_is_large=0`) — which must free the table — from 
 lower half of a split (size=6 read, `b_is_large=1`) — which must not. The upper
 half (`rx_cpl_upper=1`) always frees regardless of `b_is_large`.
 
-### 6.4 Per-flit sequence number in data beats 1–4
+### 6.4 Per-flit sequence number in data beats 1–4 — DONE (alternative path)
 
-`flit_seq_ctr` increments once per flit (counting all `hdr_fire` and
-`data_fire` pulses), so the sequence space is per-flit rather than per-burst.
-However, beats 1–4 of a data burst carry raw 128-bit data with no embedded
-header, so the receiver cannot independently verify their order within a burst.
+**Design choice**: treat each data burst as a single sequenced unit using the
+beat-0 header's `flit_seq`. Raw data beats 1–4 carry no per-beat sequence
+number and `UCIE_DATA_W` stays 128 bits. This avoids widening the data path and
+is consistent with the existing beat-0 header structure.
 
-**Changes required (if spec mandates per-flit sequence in data flits):**
-
-- Widen the data-beat payload from 128 to 144 bits (add a 16-bit metadata field
-  carrying `{flit_seq[7:0], 8'h00}`), or use a reserved prefix word.
-- Pass `tx_dat_beat_seq` (pre-computed as `dat_flit_seq + beat`) into the data
-  flit for beats 1–4.
-- RX: strip the metadata before accumulation.
-- Alternatively: treat all 5 beats of a burst as a single sequenced unit (use
-  the beat-0 header `flit_seq` as the burst sequence number and accept that
-  individual data beats are not independently sequenced). Document the choice.
-- Formal: assert that `flit_seq` in consecutive issued headers is monotonically
-  increasing (mod 256).
+**Changes**:
+- `flit_seq_ctr` now increments only on TX header flits (`hdr_fire` + burst
+  headers at `data_fire && beat_ctr==0`); raw data beats 1–4 no longer consume
+  sequence numbers. Consecutive issued TX headers (request or burst) differ by
+  exactly 1 (mod 256).
+- Formal: two assertions added to the `FORMAL` block:
+  - Co-fire: when a request header and a burst header fire in the same cycle,
+    the burst header carries `req_seq + 1`.
+  - Back-to-back request headers with no intervening burst and no stall differ
+    by exactly 1 (uses `$past` in Yosys-compatible style).
+- Directed TB: §6.4 test verifies consecutive read-req headers are seq+1, and
+  a write's burst header is its req header's seq+1.
 
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 

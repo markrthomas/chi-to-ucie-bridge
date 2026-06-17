@@ -155,15 +155,20 @@ module chi_to_ucie_bridge #(
   // split, or a 32B completion for a txn that did not expect a split (size=5 read).
   wire       rx_cpl_frees_tbl = !rx_cpl_is_split || rx_cpl_upper || !b_is_large;
 
-  // Flit sequence counter
+  // Flit sequence counter.
+  // §6.4 choice: treat each data burst as a single sequenced unit using the beat-0
+  // header flit_seq; raw data beats 1–4 carry no sequence number.  Only TX header
+  // flits (UCIe request headers and write/read-data burst headers at beat 0) consume
+  // sequence numbers, so consecutive TX headers always differ by exactly 1 (mod 256).
   reg [7:0] flit_seq_ctr;
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n)
       flit_seq_ctr <= 8'h00;
     else
-      flit_seq_ctr <= flit_seq_ctr + {7'h0, hdr_fire} + {7'h0, data_fire};
+      flit_seq_ctr <= flit_seq_ctr + {7'h0, hdr_fire}
+                                   + {7'h0, data_fire && tx_dat_beat_ctr == 3'd0};
   end
-  // When header and data fire simultaneously, data gets the next sequence number.
+  // When a request header and data burst header co-fire, the burst header gets seq+1.
   wire [7:0] dat_flit_seq = flit_seq_ctr + {7'h0, hdr_fire};
 
   wire req_r_empty_clk;
@@ -716,6 +721,27 @@ module chi_to_ucie_bridge #(
         assert (chi_comp_data_valid);
         assert ($stable(chi_comp_data));
       end
+    end
+  end
+
+  // §6.4: flit_seq monotonicity.
+  // (a) When a request header and a burst header co-fire in the same cycle,
+  //     the burst header carries seq = req-header seq + 1.
+  // (b) Back-to-back request headers with no intervening burst header and no
+  //     stalling on the later header differ by exactly 1 (mod 256).
+  always @(posedge ucie_clk) begin
+    if (ucie_rst_n) begin
+      if (hdr_fire && data_fire && tx_dat_beat_ctr == 3'd0)
+        assert (ucie_tx_data[UCIE_SEQ_MSB:UCIE_SEQ_LSB] ==
+                ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB] + 8'h1);
+    end
+  end
+  always @(posedge ucie_clk) begin
+    if (ucie_rst_n && f_ucie_past_valid) begin
+      if ($past(hdr_fire) && hdr_fire && !held_v &&
+          !$past(data_fire && (tx_dat_beat_ctr == 3'd0)))
+        assert (ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB] ==
+                $past(ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB]) + 8'h1);
     end
   end
 `endif

@@ -659,6 +659,40 @@ module tb_chi_to_ucie_bridge;
       @(posedge clk);
     end
 
+    $display("INFO: §6.4 TX header flit_seq monotonically increasing (burst treated as single unit)");
+    begin : subcl_seq
+      reg [7:0] seq_a, seq_b, seq_wr;
+      // Two consecutive reads: each req header should increment flit_seq by 1.
+      send_chi_read(8'hE1, 48'h1000_0000_0000, 3'h6);
+      wait (ucie_tx_hdr_valid);
+      seq_a = ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB];
+      @(posedge ucie_clk);
+      send_chi_read(8'hE2, 48'h2000_0000_0000, 3'h6);
+      wait (ucie_tx_hdr_valid);
+      seq_b = ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB];
+      @(posedge ucie_clk);
+      if (seq_b !== seq_a + 8'h1) begin
+        $display("FAIL: §6.4: read B flit_seq not seq_A+1 (got %h exp %h)",
+                 seq_b, seq_a + 8'h1); $finish(1);
+      end
+      // Write: req header gets seq_B+1; data burst header (beat 0) gets seq_B+2.
+      send_chi_write(8'hE3, 48'h3000_0000_0000, 512'hCC, 3'h6);
+      wait (ucie_tx_hdr_valid);
+      seq_wr = ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB];
+      if (seq_wr !== seq_b + 8'h1) begin
+        $display("FAIL: §6.4: write req header flit_seq not seq_B+1 (got %h exp %h)",
+                 seq_wr, seq_b + 8'h1); $finish(1);
+      end
+      @(posedge ucie_clk);
+      wait (ucie_tx_data_valid);
+      #1;
+      if (ucie_tx_data[UCIE_SEQ_MSB:UCIE_SEQ_LSB] !== seq_wr + 8'h1) begin
+        $display("FAIL: §6.4: write burst header flit_seq not seq_WR+1 (got %h exp %h)",
+                 ucie_tx_data[UCIE_SEQ_MSB:UCIE_SEQ_LSB], seq_wr + 8'h1); $finish(1);
+      end
+      @(posedge ucie_clk);
+    end
+
     $display("PASS CHI-to-UCIe bridge directed smoke");
     $finish(0);
   end
