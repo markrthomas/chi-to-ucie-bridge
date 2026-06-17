@@ -439,25 +439,18 @@ at the far-side memory controller.
 - Directed TB: `WRITENOSNPPTL` with size=5 (32 bytes), BE=`64'h0000_FFFF_FFFF_FFFF`,
   verify correct BE arrives at `chi_wr_data` and is forwarded to UCIe.
 
-### 6.3 Split read-completion handling (`DataID`)
+### 6.3 Split read-completion handling (`DataID`) — DONE
 
-The RX path sets `dat[CHI_DAT_DATAID] = 4'h0` unconditionally, assuming each
-UCIe MEM_CPL brings a single full 64-byte completion. CHI allows split delivery
-via `DataID`: two 32-byte halves arrive as separate `CHI_DAT_COMPDATA` responses
-with `DataID=0` and `DataID=2` respectively.
+Two 32-byte MEM_CPL bursts for the same local tag map to two CHI `COMPDATA`
+flits. `DataID` is derived from `addr[4]` of the MEM_CPL beat-0 header:
+`0 → DataID=0` (lower half, data at `[255:0]`), `1 → DataID=2` (upper half,
+data shifted to `[511:256]`).
 
-**Changes required:**
-
-- In `translate_ucie_data_to_chi`: derive `DataID` from the data-burst header's
-  `addr[4]` bit (or a new code sub-field) to distinguish first/second half.
-- Add a 32-byte accumulation path: detect `length == 8'h20` (32 bytes), store
-  the first half, issue two CHI `COMPDATA` flits in sequence with
-  `DataID=0` then `DataID=2`.
-- Gate the `rdat_fifo` write on both halves arriving (or issue two writes if CHI
-  accepts split delivery).
-- Alternatively: assert (formally and in directed TB) that the far-side always
-  returns 64-byte completions (`length == 8'h40`), document the assumption in
-  the design header, and defer true split-completion support.
+`txn_table` gained `alloc_is_large` (set for size≥6 reads) and `b_is_large`
+output. `rx_cpl_frees_tbl` uses `b_is_large` to distinguish a standalone 32B
+completion (size=5 read, `b_is_large=0`) — which must free the table — from the
+lower half of a split (size=6 read, `b_is_large=1`) — which must not. The upper
+half (`rx_cpl_upper=1`) always frees regardless of `b_is_large`.
 
 ### 6.4 Per-flit sequence number in data beats 1–4
 

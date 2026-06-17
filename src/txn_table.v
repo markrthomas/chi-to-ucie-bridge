@@ -27,6 +27,7 @@ module txn_table #(
   input  wire [TID_W-1:0]    alloc_txnid,
   input  wire [SID_W-1:0]    alloc_srcid,
   input  wire                alloc_is_write,
+  input  wire                alloc_is_large,  // §6.3: set for size>=6 reads; used to distinguish split from standalone
   output wire [LTAG_W-1:0]   free_tag,
   output wire                full,
 
@@ -45,6 +46,7 @@ module txn_table #(
   output wire [SID_W-1:0]    b_srcid,
   output wire                b_is_write,
   output wire                b_valid,
+  output wire                b_is_large,   // §6.3: reflects alloc_is_large for the looked-up tag
 
   // Observability
   output reg  [LTAG_W:0]     outstanding,
@@ -54,6 +56,7 @@ module txn_table #(
   localparam integer ENTRY_W = TID_W + SID_W + 1;
 
   reg [N-1:0]       valid;
+  reg [N-1:0]       is_large;
   reg [ENTRY_W-1:0] entry [0:N-1];
 
   // Lowest free index (priority encoder over the inverted valid vector).
@@ -79,8 +82,9 @@ module txn_table #(
   wire [ENTRY_W-1:0] b_entry = entry[b_lookup_tag];
   assign {a_is_write, a_srcid, a_txnid} = a_entry;
   assign {b_is_write, b_srcid, b_txnid} = b_entry;
-  assign a_valid = valid[a_lookup_tag];
-  assign b_valid = valid[b_lookup_tag];
+  assign a_valid    = valid[a_lookup_tag];
+  assign b_valid    = valid[b_lookup_tag];
+  assign b_is_large = is_large[b_lookup_tag];
 
   wire do_alloc = alloc_en && have_free;
   wire a_free   = a_free_en && a_valid;
@@ -94,6 +98,7 @@ module txn_table #(
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       valid       <= {N{1'b0}};
+      is_large    <= {N{1'b0}};
       outstanding <= {(LTAG_W+1){1'b0}};
       tag_err     <= 1'b0;
     end else begin
@@ -107,8 +112,10 @@ module txn_table #(
           valid[i] <= 1'b0;
       end
 
-      if (do_alloc)
-        entry[alloc_idx] <= {alloc_is_write, alloc_srcid, alloc_txnid};
+      if (do_alloc) begin
+        entry[alloc_idx]    <= {alloc_is_write, alloc_srcid, alloc_txnid};
+        is_large[alloc_idx] <= alloc_is_large;
+      end
 
       outstanding <= outstanding + alloc_inc - free_dec;
 

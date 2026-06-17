@@ -142,6 +142,19 @@ module chi_to_ucie_bridge #(
   reg  [2:0] rx_burst_beats;  // latched from beat-0 MEM_CPL header length[6:4]
   wire rx_dat_last = (rx_dat_beat_ctr != 3'd0) && (rx_dat_beat_ctr == rx_burst_beats);
 
+  // §6.3: rx_hdr_latch and split-completion signals declared early so they are
+  // visible in the txn_table port-connection expression (Icarus forward-ref rule).
+  reg [UCIE_HDR_W-1:0] rx_hdr_latch;
+  wire       rx_cpl_is_split  = (rx_hdr_latch[UCIE_LEN_MSB:UCIE_LEN_LSB] == 8'h20);
+  wire       rx_cpl_upper     = rx_hdr_latch[UCIE_ADDR_LSB + 4];
+  wire [3:0] rx_cpl_dataid    = rx_cpl_is_split ? {2'b00, rx_cpl_upper, 1'b0} : 4'h0;
+  // b_is_large forward-declared here (driven by txn_table output below) so it is
+  // in scope for rx_cpl_frees_tbl, which is itself used in the txn_table port list.
+  wire       b_is_large;
+  // Free the table entry when: standalone (not a 32B half), the upper half of a
+  // split, or a 32B completion for a txn that did not expect a split (size=5 read).
+  wire       rx_cpl_frees_tbl = !rx_cpl_is_split || rx_cpl_upper || !b_is_large;
+
   // Flit sequence counter
   reg [7:0] flit_seq_ctr;
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
@@ -329,6 +342,7 @@ module chi_to_ucie_bridge #(
   wire [NODEID_W-1:0] b_srcid;
   wire                b_is_write;
   wire                b_valid;
+  // b_is_large declared earlier in the §6.3 block (Icarus forward-ref rule).
   wire [LTAG_W:0]    outstanding;
 
   txn_table #(
@@ -340,12 +354,15 @@ module chi_to_ucie_bridge #(
     .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
     .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
     .alloc_is_write(req_head_is_write),
+    .alloc_is_large(!req_head_is_write &&
+                    (req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W] >= 3'd6)),
     .free_tag(free_tag),
     .full(tbl_full),
     .a_lookup_tag(rx_hdr_tag), .a_free_en(rx_hdr_fire),
     .a_txnid(a_txnid), .a_srcid(a_srcid), .a_is_write(a_is_write), .a_valid(a_valid),
-    .b_lookup_tag(rx_dat_tag), .b_free_en(rx_dat_fire && rx_dat_last),
+    .b_lookup_tag(rx_dat_tag), .b_free_en(rx_dat_fire && rx_dat_last && rx_cpl_frees_tbl),
     .b_txnid(b_txnid), .b_srcid(b_srcid), .b_is_write(b_is_write), .b_valid(b_valid),
+    .b_is_large(b_is_large),
     .outstanding(outstanding), .tag_err(tbl_tag_err)
   );
 
@@ -415,7 +432,7 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   reg [511:0] rx_dat_accum;
   reg         rx_dat_poison_latched;
-  reg [UCIE_HDR_W-1:0] rx_hdr_latch;
+  // rx_hdr_latch declared early (see §6.3 block near top) for Icarus compatibility.
 
   always @(posedge ucie_clk) begin
     if (rx_dat_fire) begin
@@ -452,6 +469,7 @@ module chi_to_ucie_bridge #(
       rx_dat_valid_latched <= b_valid;
     end
   end
+
 
   // ---------------------------------------------------------------------------
   // CHI -> UCIe translation (TX)
@@ -566,6 +584,7 @@ module chi_to_ucie_bridge #(
     input                  poison;
     input [TXNID_W-1:0]    r_txnid;
     input                  r_valid;
+    input [3:0]            dataid;  // §6.3: DataID for split-completion positioning
     reg [CHI_DAT_W-1:0] dat;
     reg ok;
     begin
@@ -573,10 +592,15 @@ module chi_to_ucie_bridge #(
            (hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_MEM_CPL) &&
            (hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] == UCIE_CPL_SC);
       dat = {CHI_DAT_W{1'b0}};
-      dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W]       = data;
+      // DataID=2 (upper half): shift the 256 accumulated bits into [511:256].
+      // DataID=0 (lower half or full 64B): pass data through unchanged.
+      if (dataid[1])
+        dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W] = {data[255:0], 256'h0};
+      else
+        dat[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W] = data;
       dat[CHI_DAT_BE_LSB +: CHI_DAT_BE_W]           = {BE_W{1'b1}};
       dat[CHI_DAT_POISON_LSB +: CHI_DAT_POISON_W]   = poison;
-      dat[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W]   = 4'h0;
+      dat[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W]   = dataid;
       dat[CHI_DAT_RESPERR_LSB +: CHI_DAT_RESPERR_W] = ok ? CHI_RESPERR_OK : CHI_RESPERR_DERR;
       dat[CHI_DAT_RESP_LSB +: CHI_DAT_RESP_W]       = CHI_CACHE_I;
       dat[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W]     = r_txnid;
@@ -602,7 +626,7 @@ module chi_to_ucie_bridge #(
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_rdat_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_dat_fire && rx_dat_last),
-    .w_data(translate_ucie_data_to_chi(rx_hdr_latch, rx_dat_full, rx_dat_poison_latched, rx_dat_txnid_latched, rx_dat_valid_latched)), .w_full(rdat_w_full),
+    .w_data(translate_ucie_data_to_chi(rx_hdr_latch, rx_dat_full, rx_dat_poison_latched, rx_dat_txnid_latched, rx_dat_valid_latched, rx_cpl_dataid)), .w_full(rdat_w_full),
     .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_comp_data_valid && chi_comp_data_ready),
     .r_data(rdat_r_data), .r_empty(rdat_r_empty)
   );

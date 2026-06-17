@@ -276,6 +276,46 @@ module tb_chi_to_ucie_bridge;
     end
   endtask
 
+  // §6.3: split-completion driver.  Sends two 32-byte MEM_CPL bursts for the
+  // same local tag: first with addr[4]=0 (lower half, DataID=0), second with
+  // addr[4]=1 (upper half, DataID=2).  data[255:0] = lower, data[511:256] = upper.
+  task automatic drive_rx_split;
+    input [7:0]   tag;
+    input [511:0] data;
+    reg [UCIE_HDR_W-1:0] hdr;
+    integer i;
+    begin
+      // Lower half: addr[4]=0, length=0x20, 2 data beats
+      hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
+                          48'h0000_0000_0000, 8'h20, 8'h55, 8'h00, 8'h00);
+      ucie_rx_data = hdr;
+      ucie_rx_data_valid = 1'b1;
+      while (!ucie_rx_data_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk); #1;
+      for (i = 0; i < 2; i = i + 1) begin
+        ucie_rx_data = data[i*128 +: 128];
+        ucie_rx_data_valid = 1'b1;
+        while (!ucie_rx_data_ready) @(posedge ucie_clk);
+        @(posedge ucie_clk); #1;
+      end
+      ucie_rx_data_valid = 1'b0;
+      // Upper half: addr[4]=1 (addr=0x10), length=0x20, 2 data beats
+      hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
+                          48'h0000_0000_0010, 8'h20, 8'h55, 8'h00, 8'h00);
+      ucie_rx_data = hdr;
+      ucie_rx_data_valid = 1'b1;
+      while (!ucie_rx_data_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk); #1;
+      for (i = 0; i < 2; i = i + 1) begin
+        ucie_rx_data = data[256 + i*128 +: 128];
+        ucie_rx_data_valid = 1'b1;
+        while (!ucie_rx_data_ready) @(posedge ucie_clk);
+        @(posedge ucie_clk); #1;
+      end
+      ucie_rx_data_valid = 1'b0;
+    end
+  endtask
+
   initial begin
     clk = 1'b0;
     ucie_clk = 1'b0;
@@ -575,6 +615,46 @@ module tb_chi_to_ucie_bridge;
       wait (chi_rsp_valid);
       if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hC3) begin
         $display("FAIL: §6.2: CHI RSP TxnID not restored to 0xC3"); $finish(1);
+      end
+      @(posedge clk);
+    end
+
+    $display("INFO: §6.3 split read-completion: two 32-byte MEM_CPLs -> two CHI CompData");
+    begin : subcl_split
+      reg [7:0]   split_tag;
+      reg [511:0] split_data;
+      // Lower half: data[255:0], upper half: data[511:256] — both non-zero and distinct.
+      split_data = {
+        256'hDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0_F0E1_D2C3_B4A5_9687_7869_5A4B_3C2D_1E0F,
+        256'hAABB_CCDD_EEFF_0011_2233_4455_6677_8899_A0B0_C0D0_E0F0_0010_2030_4050_6070_8090
+      };
+      send_chi_read(8'hD5, 48'h5555_AAAA_0000, 3'h6);
+      wait (ucie_tx_hdr_valid);
+      split_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+      drive_rx_split(split_tag, split_data);
+      // First CompData: DataID=0, split_data[255:0] at CHI DATA[255:0]
+      wait (chi_comp_data_valid);
+      if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'hD5) begin
+        $display("FAIL: §6.3: first CompData TxnID mismatch"); $finish(1);
+      end
+      if (chi_comp_data[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W] !== 4'h0) begin
+        $display("FAIL: §6.3: first CompData DataID not 0 (got %h)", chi_comp_data[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W]); $finish(1);
+      end
+      if (chi_comp_data[CHI_DAT_DATA_LSB +: 256] !== split_data[255:0]) begin
+        $display("FAIL: §6.3: first CompData lower 256 bits mismatch"); $finish(1);
+      end
+      @(posedge clk);
+      // Second CompData: DataID=2, split_data[511:256] at CHI DATA[511:256]; lower 256 must be zero
+      wait (chi_comp_data_valid && chi_comp_data[CHI_DAT_DATAID_LSB +: CHI_DAT_DATAID_W] === 4'h2);
+      if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'hD5) begin
+        $display("FAIL: §6.3: second CompData TxnID mismatch"); $finish(1);
+      end
+      if (chi_comp_data[CHI_DAT_DATA_LSB +: 256] !== 256'h0) begin
+        $display("FAIL: §6.3: second CompData lower 256 bits not zero (DataID=2 placement bug)"); $finish(1);
+      end
+      if (chi_comp_data[CHI_DAT_DATA_LSB+256 +: 256] !== split_data[511:256]) begin
+        $display("FAIL: §6.3: second CompData upper 256 bits mismatch"); $finish(1);
       end
       @(posedge clk);
     end
