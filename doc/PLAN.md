@@ -388,6 +388,97 @@ Note: full per-class reorder buffering (reads overtaking writes) is deferred;
 this phase guarantees QoS observability and correctness of the priority field
 end-to-end without restructuring the single-queue TX path.
 
+## Phase 6 - Flit Protocol Completeness
+
+The Phase 4.3 multi-beat flit implementation handles full-cacheline (64-byte)
+transfers correctly but has four gaps against the full CHI protocol:
+
+### 6.1 Variable data-burst length (scaled to CHI `size`) (done)
+
+Currently `tx_dat_beat_ctr` always counts 0–4 (5 flits = 1 header + 4 × 128-bit
+data beats = 512 bits). The data-burst header's `length` field is hardcoded to
+`8'h40` (64 bytes). For transfers smaller than a full cacheline this is wrong.
+
+**Changes required:**
+
+- Compute `burst_beats = max(1, (1 << chi_size) / 16)` — number of 128-bit data
+  beats for the given CHI `size[2:0]` (size=4 → 1 beat, size=5 → 2 beats,
+  size=6 → 4 beats). Store `burst_beats-1` (fits in 2 bits for sizes 4–6) in the
+  write-data side-queue alongside the existing local tag.
+- On TX: replace the `tx_dat_last = (tx_dat_beat_ctr == 3'd4)` constant with a
+  comparison against the popped burst-beats value.
+- In `translate_chi_data_to_ucie` beat 0: derive `length` from `chi_size`
+  (`8'h01 << chi_size`) instead of hardcoding `8'h40`.
+- On RX: the data-burst header's `length` field already encodes the byte count;
+  derive `rx_burst_beats = length[6:4]` and compare against `rx_dat_beat_ctr`.
+  Replace the hardcoded `rx_dat_last = (rx_dat_beat_ctr == 3'd4)`.
+- Update `rx_dat_full` assembly: for bursts shorter than 4 data beats, pack from
+  `rx_dat_accum` only for the beats that arrived; zero-extend the rest.
+- Directed TB: add sub-cacheline write test (size=5, 32 bytes → 2 data beats).
+- Formal: add assertion `tx_dat_beat_ctr <= burst_beats` never overruns.
+
+### 6.2 Byte-enable forwarding for partial writes (`WRITENOSNPPTL`)
+
+`CHI_DAT_BE[63:0]` carries a per-byte write-enable mask but the bridge discards
+it. On RX completions the bridge reconstructs with `dat[CHI_DAT_BE] = {BE_W{1'b1}}`
+(all enables asserted), so a partial write silently becomes a full 64-byte write
+at the far-side memory controller.
+
+**Changes required:**
+
+- Carry `CHI_DAT_BE[63:0]` through the `wdat_fifo` (it is already part of
+  `CHI_DAT_W`; the FIFO already stores the full CHI DAT flit including BE).
+- In `translate_chi_data_to_ucie` beat 0: pack `dat[CHI_DAT_BE_LSB +: BE_W]`
+  into reserved bits of the data-burst header (bits [31:16] are currently zero;
+  a 64-bit BE does not fit there). Options: (a) carry BE in a new beat-0 payload
+  word (requires extending the `UCIE_DATA_W` beat to 256 bits), or (b) add a
+  dedicated BE side-channel port alongside `ucie_tx_data`. Simplest for this
+  bridge: add `ucie_tx_data_be[63:0]` output valid only on beat 0.
+- Update `translate_ucie_data_to_chi` to propagate the recovered BE instead of
+  all-ones.
+- Directed TB: `WRITENOSNPPTL` with size=5 (32 bytes), BE=`64'h0000_FFFF_FFFF_FFFF`,
+  verify correct BE arrives at `chi_wr_data` and is forwarded to UCIe.
+
+### 6.3 Split read-completion handling (`DataID`)
+
+The RX path sets `dat[CHI_DAT_DATAID] = 4'h0` unconditionally, assuming each
+UCIe MEM_CPL brings a single full 64-byte completion. CHI allows split delivery
+via `DataID`: two 32-byte halves arrive as separate `CHI_DAT_COMPDATA` responses
+with `DataID=0` and `DataID=2` respectively.
+
+**Changes required:**
+
+- In `translate_ucie_data_to_chi`: derive `DataID` from the data-burst header's
+  `addr[4]` bit (or a new code sub-field) to distinguish first/second half.
+- Add a 32-byte accumulation path: detect `length == 8'h20` (32 bytes), store
+  the first half, issue two CHI `COMPDATA` flits in sequence with
+  `DataID=0` then `DataID=2`.
+- Gate the `rdat_fifo` write on both halves arriving (or issue two writes if CHI
+  accepts split delivery).
+- Alternatively: assert (formally and in directed TB) that the far-side always
+  returns 64-byte completions (`length == 8'h40`), document the assumption in
+  the design header, and defer true split-completion support.
+
+### 6.4 Per-flit sequence number in data beats 1–4
+
+`flit_seq_ctr` increments once per flit (counting all `hdr_fire` and
+`data_fire` pulses), so the sequence space is per-flit rather than per-burst.
+However, beats 1–4 of a data burst carry raw 128-bit data with no embedded
+header, so the receiver cannot independently verify their order within a burst.
+
+**Changes required (if spec mandates per-flit sequence in data flits):**
+
+- Widen the data-beat payload from 128 to 144 bits (add a 16-bit metadata field
+  carrying `{flit_seq[7:0], 8'h00}`), or use a reserved prefix word.
+- Pass `tx_dat_beat_seq` (pre-computed as `dat_flit_seq + beat`) into the data
+  flit for beats 1–4.
+- RX: strip the metadata before accumulation.
+- Alternatively: treat all 5 beats of a burst as a single sequenced unit (use
+  the beat-0 header `flit_seq` as the burst sequence number and accept that
+  individual data beats are not independently sequenced). Document the choice.
+- Formal: assert that `flit_seq` in consecutive issued headers is monotonically
+  increasing (mod 256).
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):

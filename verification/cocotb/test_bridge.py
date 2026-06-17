@@ -115,12 +115,17 @@ def pack_ucie_hdr(kind, code, tag, addr48=0, length=0, src_id=0, attr=0, flit_se
     return raw | (crc & 0xFFFF)
 
 
-def pack_mem_cpl_burst(tag, data, poison=0):
-    """Returns a list of 5 flits (128-bit each) for a MEM_CPL read completion."""
+def pack_mem_cpl_burst(tag, data, poison=0, size=6):
+    """Returns header + data flits for a MEM_CPL read completion.
+
+    size=4 → 1 data beat (16B), size=5 → 2 beats (32B), size=6 → 4 beats (64B).
+    """
+    length = 1 << size          # byte count
+    num_beats = max(1, length >> 4)  # 128-bit data beats
     hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
-                        0x0000_0000_0040, 0x40, 0x55, (poison << 7), 0)
+                        0x0000_0000_0040, length & 0xFF, 0x55, (poison << 7), 0)
     flits = [hdr]
-    for i in range(4):
+    for i in range(num_beats):
         flits.append((data >> (128 * i)) & ((1 << 128) - 1))
     return flits
 
@@ -306,11 +311,15 @@ async def test_random_traffic(dut):
                         f"got attr[3:0]={qos_got} expected {exp_qos}"
                     )
 
+    UCIE_LEN_LSB = 96  # length field in data-burst beat-0 header
+
     # ---- UCIe TX data consumer: check write-data burst by local tag ----
+    # §6.1: beat count is derived from the length field in the burst's beat-0 header.
     async def tx_data_consumer():
         beat_ctr = 0
         tag = 0
         accum = 0
+        last_beat = 4  # default until overridden from beat-0 header
         while state["running"]:
             dut.ucie_tx_data_ready.value = rdy()
             await RisingEdge(dut.ucie_clk)
@@ -318,18 +327,20 @@ async def test_random_traffic(dut):
                 val = int(dut.ucie_tx_data.value)
                 if beat_ctr == 0:
                     tag = field(val, UCIE_TAG_LSB, 8)
+                    length = field(val, UCIE_LEN_LSB, 8)
+                    last_beat = max(1, length >> 4)  # num 128-bit data beats
                     accum = 0
                 else:
                     accum |= (val << (128 * (beat_ctr - 1)))
 
-                if beat_ctr == 4:
+                if beat_ctr == last_beat:
                     info = tag_info.get(tag)
+                    exp_mask = (1 << (128 * last_beat)) - 1
                     if info is None:
                         sb.errors.append(f"write data for unknown tag {tag}")
-                    elif accum != data_for(info["addr16"]):
+                    elif (accum & exp_mask) != (data_for(info["addr16"]) & exp_mask):
                         sb.errors.append(f"write data payload mismatch tag {tag}")
                     else:
-                        # Write data received: now the far side can complete it.
                         pend_adcpl.append(tag)
                     beat_ctr = 0
                 else:

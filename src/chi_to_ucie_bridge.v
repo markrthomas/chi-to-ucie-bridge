@@ -131,11 +131,15 @@ module chi_to_ucie_bridge #(
   wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
   wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
 
-  // Multi-beat burst counters (§4.3)
+  // Multi-beat burst counters (§4.3 / §6.1)
   reg [2:0] tx_dat_beat_ctr;
-  wire tx_dat_last = (tx_dat_beat_ctr == 3'd4);
-  reg [2:0] rx_dat_beat_ctr;
-  wire rx_dat_last = (rx_dat_beat_ctr == 3'd4);
+  // wq_front_last_beat and tx_dat_last are assigned near the wq declarations below
+  // (after wq_front_size is defined) to satisfy Icarus's no-forward-reference rule.
+  wire [2:0] wq_front_last_beat;
+  wire       tx_dat_last;
+  reg  [2:0] rx_dat_beat_ctr;
+  reg  [2:0] rx_burst_beats;  // latched from beat-0 MEM_CPL header length[6:4]
+  wire rx_dat_last = (rx_dat_beat_ctr != 3'd0) && (rx_dat_beat_ctr == rx_burst_beats);
 
   // Flit sequence counter
   reg [7:0] flit_seq_ctr;
@@ -260,10 +264,18 @@ module chi_to_ucie_bridge #(
   end
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
-    if (!ucie_rst_n)
+    if (!ucie_rst_n) begin
       rx_dat_beat_ctr <= 3'd0;
-    else if (rx_dat_fire)
-      rx_dat_beat_ctr <= rx_dat_last ? 3'd0 : rx_dat_beat_ctr + 3'd1;
+      rx_burst_beats  <= 3'd4;  // default to 4-beat (64B) until overridden
+    end else begin
+      if (rx_dat_fire) begin
+        rx_dat_beat_ctr <= rx_dat_last ? 3'd0 : rx_dat_beat_ctr + 3'd1;
+        // Latch burst length from the beat-0 MEM_CPL header: length[6:4] = num_data_beats.
+        // length=0x10→1 beat, 0x20→2 beats, 0x40→4 beats.
+        if (rx_dat_beat_ctr == 3'd0)
+          rx_burst_beats <= ucie_rx_data[UCIE_LEN_LSB+4 +: 3];
+      end
+    end
   end
 
   assign ucie_tx_hdr_crdt = rx_hdr_fire;
@@ -341,11 +353,25 @@ module chi_to_ucie_bridge #(
   // to data issue and enforces header-before-data ordering on the independent
   // ready paths.
   // ---------------------------------------------------------------------------
-  reg [LTAG_W-1:0] wtag_mem [0:MAX_OUTSTANDING-1];
+  reg [LTAG_W+2:0] wtag_mem [0:MAX_OUTSTANDING-1];  // §6.1: {size[2:0], tag[LTAG_W-1:0]}
   reg [WQ_AW:0]    wq_wptr;
   reg [WQ_AW:0]    wq_rptr;
   wire wq_empty = (wq_wptr == wq_rptr);
-  wire [LTAG_W-1:0] wq_front = wtag_mem[wq_rptr[WQ_AW-1:0]];
+  wire [LTAG_W-1:0] wq_front      = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W-1:0];
+  wire [2:0]         wq_front_size = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W+2:LTAG_W];
+
+  // §6.1: last data-beat index from CHI size.
+  // size=0..4 (≤16B) → 1 beat, size=5 (32B) → 2 beats, size=6 (64B) → 4 beats.
+  function automatic [2:0] size_to_last_beat;
+    input [2:0] size;
+    begin
+      if (size >= 3'd6) size_to_last_beat = 3'd4;
+      else if (size >= 3'd5) size_to_last_beat = 3'd2;
+      else size_to_last_beat = 3'd1;
+    end
+  endfunction
+  assign wq_front_last_beat = size_to_last_beat(wq_front_size);
+  assign tx_dat_last        = (tx_dat_beat_ctr == wq_front_last_beat);
 
   wire wq_push = hdr_fire && req_head_is_write;
   wire wq_pop  = data_fire && tx_dat_last;
@@ -356,7 +382,7 @@ module chi_to_ucie_bridge #(
       wq_rptr <= {(WQ_AW+1){1'b0}};
     end else begin
       if (wq_push) begin
-        wtag_mem[wq_wptr[WQ_AW-1:0]] <= present_tag;
+        wtag_mem[wq_wptr[WQ_AW-1:0]] <= {req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W], present_tag};
         wq_wptr <= wq_wptr + 1'b1;
       end
       if (wq_pop) wq_rptr <= wq_rptr + 1'b1;
@@ -407,8 +433,15 @@ module chi_to_ucie_bridge #(
     end
   end
 
-  // Combinational full 512-bit data for the last beat
-  wire [511:0] rx_dat_full = {ucie_rx_data, rx_dat_accum[383:0]};
+  // Combinational full 512-bit data for the last beat; zero-extended for shorter bursts.
+  reg [511:0] rx_dat_full;
+  always @(*) begin
+    case (rx_burst_beats)
+      3'd1:    rx_dat_full = {384'h0, ucie_rx_data};                          // 1 data beat
+      3'd2:    rx_dat_full = {256'h0, ucie_rx_data, rx_dat_accum[127:0]};    // 2 data beats
+      default: rx_dat_full = {ucie_rx_data, rx_dat_accum[383:0]};            // 4 data beats
+    endcase
+  end
 
   reg [TXNID_W-1:0] rx_dat_txnid_latched;
   reg               rx_dat_valid_latched;
@@ -452,6 +485,7 @@ module chi_to_ucie_bridge #(
     input [7:0]           local_tag;
     input [7:0]           flit_seq;
     input [2:0]           beat;
+    input [2:0]           size;   // §6.1: CHI size field; drives length = 1 << size
     reg [UCIE_HDR_W-1:0] hdr;
     begin
       if (beat == 3'd0) begin
@@ -460,7 +494,7 @@ module chi_to_ucie_bridge #(
           UCIE_MSG_MEM_WR_DATA,
           local_tag,
           48'h0000_0000_0000,
-          8'h40,
+          (8'h01 << size),   // §6.1: byte count = 2^size
           8'h00,
           {dat[CHI_DAT_POISON_LSB], 7'b0},
           flit_seq
@@ -496,7 +530,7 @@ module chi_to_ucie_bridge #(
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
   assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
-                                                   present_dat_seq, tx_dat_beat_ctr);
+                                                   present_dat_seq, tx_dat_beat_ctr, wq_front_size);
   assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 
   // ---------------------------------------------------------------------------
@@ -549,7 +583,9 @@ module chi_to_ucie_bridge #(
   endfunction
 
   assign ucie_rx_hdr_ready = bridge_open_ucie && !rsp_w_full;
-  assign ucie_rx_data_ready = bridge_open_ucie && (!rdat_w_full || rx_dat_beat_ctr < 3'd4);
+  // Accept non-last beats unconditionally (they don't write the FIFO);
+  // gate the last beat on FIFO space.  rx_dat_last is 0 at beat 0.
+  assign ucie_rx_data_ready = bridge_open_ucie && (!rdat_w_full || !rx_dat_last);
 
   wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_crc16_ok(ucie_rx_hdr);
   wire rx_dat_bad = rx_dat_fire && (rx_dat_beat_ctr == 3'd0) && !ucie_hdr_crc16_ok(ucie_rx_data);
@@ -609,6 +645,9 @@ module chi_to_ucie_bridge #(
       if (tx_dat_beat_ctr == 0)
         assert (ucie_hdr_crc16_ok(ucie_tx_data));
       assert (!ucie_tx_data_valid || !wq_empty);
+      // §6.1: data beat counter must not exceed the burst's last beat index.
+      if (ucie_tx_data_valid)
+        assert (tx_dat_beat_ctr <= wq_front_last_beat);
     end
   end
 
