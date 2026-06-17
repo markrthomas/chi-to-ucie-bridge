@@ -417,7 +417,7 @@ data beats = 512 bits). The data-burst header's `length` field is hardcoded to
 - Directed TB: add sub-cacheline write test (size=5, 32 bytes → 2 data beats).
 - Formal: add assertion `tx_dat_beat_ctr <= burst_beats` never overruns.
 
-### 6.2 Byte-enable forwarding for partial writes (`WRITENOSNPPTL`)
+### 6.2 Byte-enable forwarding for partial writes (`WRITENOSNPPTL`) (done)
 
 `CHI_DAT_BE[63:0]` carries a per-byte write-enable mask but the bridge discards
 it. On RX completions the bridge reconstructs with `dat[CHI_DAT_BE] = {BE_W{1'b1}}`

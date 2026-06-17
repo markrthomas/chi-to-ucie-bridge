@@ -49,6 +49,7 @@ module chi_to_ucie_bridge #(
   output wire                     ucie_tx_data_valid,
   output wire [UCIE_DATA_W-1:0]   ucie_tx_data,
   input  wire                     ucie_tx_data_ready,
+  output wire [BE_W-1:0]          ucie_tx_data_be,  // §6.2: write BE, valid on beat 0 only
 
   input  wire                     ucie_rx_hdr_valid,
   input  wire [UCIE_HDR_W-1:0]    ucie_rx_hdr,
@@ -531,6 +532,8 @@ module chi_to_ucie_bridge #(
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
   assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
                                                    present_dat_seq, tx_dat_beat_ctr, wq_front_size);
+  assign ucie_tx_data_be = (tx_dat_beat_ctr == 3'd0) ? wdat_r_data[CHI_DAT_BE_LSB +: BE_W]
+                                                      : {BE_W{1'b1}};
   assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
 
   // ---------------------------------------------------------------------------

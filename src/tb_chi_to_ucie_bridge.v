@@ -33,6 +33,7 @@ module tb_chi_to_ucie_bridge;
   wire                   ucie_tx_data_valid;
   wire [UCIE_DATA_W-1:0] ucie_tx_data;
   reg                    ucie_tx_data_ready;
+  wire [BE_W-1:0]        ucie_tx_data_be;
 
   reg                   ucie_rx_hdr_valid;
   reg [UCIE_HDR_W-1:0]  ucie_rx_hdr;
@@ -97,6 +98,7 @@ module tb_chi_to_ucie_bridge;
     .ucie_tx_data_valid(ucie_tx_data_valid),
     .ucie_tx_data(ucie_tx_data),
     .ucie_tx_data_ready(ucie_tx_data_ready),
+    .ucie_tx_data_be(ucie_tx_data_be),
     .ucie_rx_hdr_valid(ucie_rx_hdr_valid),
     .ucie_rx_hdr(ucie_rx_hdr),
     .ucie_rx_hdr_ready(ucie_rx_hdr_ready),
@@ -211,6 +213,35 @@ module tb_chi_to_ucie_bridge;
       while (!chi_req_ready) @(posedge clk);
       @(posedge clk);
       chi_req_valid = 1'b0;
+      chi_wr_data_valid = 1'b0;
+    end
+  endtask
+
+  // §6.2: partial-write helper — uses WRITENOSNPPTL with caller-supplied BE mask.
+  task automatic send_chi_partial_write;
+    input [7:0]   txnid;
+    input [47:0]  addr;
+    input [511:0] data;
+    input [63:0]  be;
+    input [2:0]   size;
+    begin
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_WRITENOSNPPTL;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = addr;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = txnid;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h34;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = size;
+      chi_wr_data = {CHI_DAT_W{1'b0}};
+      chi_wr_data[CHI_DAT_OPCODE_LSB  +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
+      chi_wr_data[CHI_DAT_TXNID_LSB   +: CHI_DAT_TXNID_W]  = txnid;
+      chi_wr_data[CHI_DAT_BE_LSB      +: CHI_DAT_BE_W]     = be;
+      chi_wr_data[CHI_DAT_DATA_LSB    +: CHI_DAT_DATA_W]   = data;
+      chi_req_valid    = 1'b1;
+      chi_wr_data_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid    = 1'b0;
       chi_wr_data_valid = 1'b0;
     end
   endtask
@@ -496,6 +527,54 @@ module tb_chi_to_ucie_bridge;
       end
       if (chi_comp_data[CHI_DAT_DATA_LSB+256 +: 256] !== 256'h0) begin
         $display("FAIL: size=5 read: upper 256 bits not zero-extended"); $finish(1);
+      end
+      @(posedge clk);
+    end
+
+    $display("INFO: §6.2 WRITENOSNPPTL BE forwarding (BE=64'h0000_FFFF_FFFF_FFFF, size=5)");
+    begin : subcl_be
+      reg [7:0]   be_tag;
+      reg [63:0]  exp_be;
+      reg [511:0] be_data;
+      exp_be  = 64'h0000_FFFF_FFFF_FFFF;
+      be_data = 512'hA0B1C2D3_E4F50617_28394A5B_6C7D8E9F_1A2B3C4D_5E6F7081_92A3B4C5_D6E7F809;
+      send_chi_partial_write(8'hC3, 48'h1234_5678_9ABC, be_data, exp_be, 3'h5);
+      wait (ucie_tx_hdr_valid);
+      #1;
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== UCIE_MSG_MEM_WR) begin
+        $display("FAIL: §6.2: expected MEM_WR header"); $finish(1);
+      end
+      be_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+      // Beat 0: data-burst header — ucie_tx_data_be must carry the CHI_DAT_BE
+      wait (ucie_tx_data_valid);
+      #1;
+      if (ucie_tx_data_be !== exp_be) begin
+        $display("FAIL: §6.2: ucie_tx_data_be=%h exp %h", ucie_tx_data_be, exp_be); $finish(1);
+      end
+      @(posedge ucie_clk);
+      // Beat 1: first 128 bits
+      #1;
+      if (ucie_tx_data !== be_data[127:0]) begin
+        $display("FAIL: §6.2: beat-1 data mismatch"); $finish(1);
+      end
+      @(posedge ucie_clk);
+      // Beat 2: second 128 bits (last for size=5)
+      #1;
+      if (ucie_tx_data !== be_data[255:128]) begin
+        $display("FAIL: §6.2: beat-2 data mismatch"); $finish(1);
+      end
+      @(posedge ucie_clk);
+      // AD_CPL → CHI RSP Comp with TxnID restored
+      ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, be_tag,
+                                  48'h0, 8'h00, 8'h55, 8'h00, 8'h00);
+      ucie_rx_hdr_valid = 1'b1;
+      while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk);
+      ucie_rx_hdr_valid = 1'b0;
+      wait (chi_rsp_valid);
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hC3) begin
+        $display("FAIL: §6.2: CHI RSP TxnID not restored to 0xC3"); $finish(1);
       end
       @(posedge clk);
     end
