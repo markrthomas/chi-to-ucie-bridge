@@ -20,6 +20,8 @@ CHI_REQ_ADDR_LSB = 9
 CHI_REQ_OPCODE_LSB = 57
 CHI_REQ_TXNID_LSB = 64
 CHI_REQ_SRCID_LSB = 72
+CHI_REQ_TGTID_LSB = 79
+CHI_REQ_QOS_LSB   = 86
 
 CHI_REQ_READNOSNP = 0x04
 CHI_REQ_WRITENOSNPFULL = 0x1D
@@ -64,23 +66,25 @@ def field(value, lsb, width):
     return (int(value) >> lsb) & ((1 << width) - 1)
 
 
-def make_chi_read(txnid, addr, srcid=0x12, size=0x6):
+def make_chi_read(txnid, addr, srcid=0x12, size=0x6, qos=0):
     flit = 0
     flit |= (CHI_REQ_READNOSNP & 0x7F) << CHI_REQ_OPCODE_LSB
     flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
     flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
     flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
     flit |= (size & 0x7) << CHI_REQ_SIZE_LSB
+    flit |= (qos & 0xF) << CHI_REQ_QOS_LSB
     return flit
 
 
-def make_chi_write_req(txnid, addr, srcid=0x34, size=0x6):
+def make_chi_write_req(txnid, addr, srcid=0x34, size=0x6, qos=0):
     flit = 0
     flit |= (CHI_REQ_WRITENOSNPFULL & 0x7F) << CHI_REQ_OPCODE_LSB
     flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
     flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
     flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
     flit |= (size & 0x7) << CHI_REQ_SIZE_LSB
+    flit |= (qos & 0xF) << CHI_REQ_QOS_LSB
     return flit
 
 
@@ -260,6 +264,7 @@ async def test_random_traffic(dut):
     state = dict(running=True)
     cov_op = CoverGroup("tx_opcode", ["rd", "wr"])
     cov_cpl = CoverGroup("cpl_class", ["comp", "compdata"])
+    cov_qos = CoverGroup("qos_class", ["lo", "hi"])   # lo=QoS<8, hi=QoS>=8
 
     inuse = set()                 # TxnIDs currently outstanding (must be unique)
     tag_info = {}                 # local tag -> dict(is_write, addr16)
@@ -267,6 +272,7 @@ async def test_random_traffic(dut):
     pend_memcpl = []              # (local tag, data) awaiting MEM_CPL (read completion)
     pend_hdr_crdts = [0]          # TX header credits to return to bridge
     pend_dat_crdts = [0]          # TX data credits to return to bridge
+    exp_qos_by_addr = {}          # addr16 -> expected UCIe attr[3:0] (= CHI QoS)
 
     N = 80
     MAX_INFLIGHT = 12
@@ -290,6 +296,15 @@ async def test_random_traffic(dut):
                 if not is_write:
                     # Reads have no data packet; schedule the read completion now.
                     pend_memcpl.append((tag, data_for(addr16)))
+                # QoS check (§5.4): attr[3:0] must match the CHI QoS field issued.
+                qos_got = field(hdr, UCIE_ATTR_LSB, 4)
+                cov_qos.hit("hi" if qos_got >= 8 else "lo")
+                exp_qos = exp_qos_by_addr.get(addr16)
+                if exp_qos is not None and qos_got != exp_qos:
+                    sb.errors.append(
+                        f"QoS mismatch addr16={addr16:#06x}: "
+                        f"got attr[3:0]={qos_got} expected {exp_qos}"
+                    )
 
     # ---- UCIe TX data consumer: check write-data burst by local tag ----
     async def tx_data_consumer():
@@ -427,14 +442,16 @@ async def test_random_traffic(dut):
 
         inuse.add(txnid)
         sb.expect(txnid, is_write, addr & 0xFFFF)
+        qos = random.randint(0, 15)
+        exp_qos_by_addr[addr & 0xFFFF] = qos
 
         if is_write:
-            dut.chi_req_data.value = make_chi_write_req(txnid, addr)
+            dut.chi_req_data.value = make_chi_write_req(txnid, addr, qos=qos)
             dut.chi_wr_data.value = make_chi_write_data(txnid, data_for(addr & 0xFFFF))
             dut.chi_req_valid.value = 1
             dut.chi_wr_data_valid.value = 1
         else:
-            dut.chi_req_data.value = make_chi_read(txnid, addr)
+            dut.chi_req_data.value = make_chi_read(txnid, addr, qos=qos)
             dut.chi_req_valid.value = 1
 
         # hold until accepted
@@ -461,9 +478,10 @@ async def test_random_traffic(dut):
     assert int(dut.tag_err_cnt.value) == 0, f"tag_err_cnt={int(dut.tag_err_cnt.value)}"
     assert not cov_op.uncovered(), f"uncovered opcodes: {cov_op.uncovered()}"
     assert not cov_cpl.uncovered(), f"uncovered completion classes: {cov_cpl.uncovered()}"
+    assert not cov_qos.uncovered(), f"uncovered QoS bins: {cov_qos.uncovered()}"
     dut._log.info(f"random traffic OK: {sb.reads_done} reads, {sb.writes_done} writes, "
                   f"crc_err_cnt={int(dut.crc_err_cnt.value)}; "
-                  f"coverage {cov_op.report()} {cov_cpl.report()}")
+                  f"coverage {cov_op.report()} {cov_cpl.report()} {cov_qos.report()}")
 
 
 @cocotb.test(timeout_time=2, timeout_unit="ms")
@@ -604,3 +622,90 @@ async def test_random_errors(dut):
     dut._log.info(f"random errors OK: {N} reads, {st['n_corrupt']} corrupted -> "
                   f"{st['derr']} DERR, crc_err_cnt={crc}; "
                   f"coverage {cov_csum.report()} {cov_resp.report()}")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_phy_error(dut):
+    """Link-error injection: ACTIVE -> ERR_DRAIN -> RETRAIN -> ACTIVE cycle.
+
+    Exercises phy_link_ctrl S_ERR_DRAIN and S_RETRAIN states and the
+    corresponding sideband LINK_ERROR / RETRAIN_REQ / LINK_ACTIVE branches in
+    chi_to_ucie_bridge, closing the coverage gaps on those lines.
+    """
+    await reset_and_open(dut)
+
+    dut.ucie_tx_hdr_ready.value  = 1
+    dut.ucie_tx_data_ready.value = 1
+
+    # Issue N reads so the bridge is briefly active with outstanding transactions.
+    N         = 4
+    addr_base = 0xB000_0000_0000
+    for i in range(N):
+        dut.chi_req_data.value  = make_chi_read(0x20 + i, addr_base + i * 64)
+        dut.chi_req_valid.value = 1
+        accepted = False
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                accepted = True
+                break
+        assert accepted, f"read {i} not accepted by chi_req_ready"
+    dut.chi_req_valid.value = 0
+
+    # Allow the async-FIFO CDC to drain the req_fifo into the UCIe TX datapath.
+    # ucie_tx_hdr_ready=1, so all N headers fire in N ucie_clk cycles (~24 ns).
+    # 40 ucie_clk cycles is a safe margin.
+    await ClockCycles(dut.ucie_clk, 40)
+
+    # Inject link error.  All FIFOs are now empty (req_fifo drained via hdr_fire;
+    # rdat/rsp FIFOs have no completions), so drain_done is asserted immediately
+    # and the phy_link_ctrl cycles through ERR_DRAIN → RETRAIN in ~3 clk cycles.
+    PLC_ACTIVE  = 1
+    PLC_ERR_DRN = 2
+    PLC_RETRAIN = 3
+
+    await RisingEdge(dut.clk)
+    dut.link_error.value = 1
+
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if int(dut.link_state.value) == PLC_ERR_DRN:
+            break
+    assert int(dut.link_state.value) == PLC_ERR_DRN, \
+        f"expected ERR_DRAIN (2), got link_state={int(dut.link_state.value)}"
+
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if int(dut.link_state.value) == PLC_RETRAIN:
+            break
+    assert int(dut.link_state.value) == PLC_RETRAIN, \
+        f"expected RETRAIN (3), got link_state={int(dut.link_state.value)}"
+    assert int(dut.retrain_req.value) == 1, "retrain_req not asserted in RETRAIN state"
+
+    # Clear error; phy_init_done is still 1 from reset_and_open → ACTIVE recovery.
+    await RisingEdge(dut.clk)
+    dut.link_error.value = 0
+
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if int(dut.link_state.value) == PLC_ACTIVE:
+            break
+    assert int(dut.link_state.value) == PLC_ACTIVE, \
+        f"expected ACTIVE (1), got link_state={int(dut.link_state.value)}"
+
+    # Confirm the bridge reopens for new requests (reset_drain back to S_UP).
+    await ClockCycles(dut.clk, 8)
+    dut.chi_req_data.value  = make_chi_read(0xAA, addr_base + N * 64)
+    dut.chi_req_valid.value = 1
+    recovered = False
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            recovered = True
+            break
+    dut.chi_req_valid.value = 0
+    assert recovered, "bridge did not reopen after PHY error recovery"
+
+    dut._log.info(
+        "phy_error OK: ACTIVE→ERR_DRAIN→RETRAIN→ACTIVE verified; bridge reopened"
+    )

@@ -19,6 +19,7 @@ module chi_to_ucie_bridge_sva (
   input wire [UCIE_DATA_W-1:0] tx_data,
   input wire [2:0]             tx_dat_beat_ctr,
   input wire                   wq_empty,
+  input wire [3:0]             req_head_qos,  // QoS of the req_fifo head (§5.4)
   // CHI host clock domain (output completion channels)
   input wire                   clk_chi,    // clk
   input wire                   rst_chi,    // clk_rst_n
@@ -68,6 +69,13 @@ module chi_to_ucie_bridge_sva (
     tx_data_valid |-> !wq_empty
   );
 
+  // QoS routing (§5.4): every issued header carries the CHI REQ QoS[3:0] in
+  // UCIe attr[3:0] (header bits [107:104]).
+  a_qos_routed: assert property (
+    @(posedge clk) disable iff (!rst_n)
+    tx_hdr_valid |-> (tx_hdr[UCIE_ATTR_LSB +: 4] == req_head_qos)
+  );
+
   // CHI completion output channels (CHI host clock domain): a presented
   // completion holds valid and stable payload until the consumer accepts it.
   a_rsp_persist: assert property (
@@ -112,6 +120,7 @@ bind chi_to_ucie_bridge chi_to_ucie_bridge_sva u_sva (
   .tx_data(ucie_tx_data),
   .tx_dat_beat_ctr(tx_dat_beat_ctr),
   .wq_empty(wq_empty),
+  .req_head_qos(req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W]),
   .clk_chi(clk),
   .rst_chi(clk_rst_n),
   .chi_rsp_valid(chi_rsp_valid),

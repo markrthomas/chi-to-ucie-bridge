@@ -80,11 +80,13 @@ module tb_top;
     .sb_rx_valid(ucie_vif.sb_rx_valid),
     .sb_rx_data(ucie_vif.sb_rx_data),
     .sb_rx_ready(ucie_vif.sb_rx_ready),
+    .pm_l1_active(ucie_vif.pm_l1_active),
     .err_inj_en(1'b0),
     .drain_done(),
     .crc_err_cnt(),
     .tag_err_cnt(),
-    .drain_cnt()
+    .drain_cnt(),
+    .qos_hi_cnt()
   );
 
   initial begin

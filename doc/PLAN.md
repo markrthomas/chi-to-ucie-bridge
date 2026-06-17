@@ -308,6 +308,86 @@ existing targets; all 4 formal targets pass at depth 8. `phy_link_ctrl` proves:
 after passing through `S_ERR_DRAIN`, error in `S_ACTIVE` deasserts `link_up`
 next cycle, full error-recovery cycle is reachable.
 
+## Phase 5 - Polish and Protocol Completeness
+
+### 5.1 CI gate validation (done)
+
+`make ci` (regress + formal + synth) passes cleanly on the §4.4 source list.
+Synthesis stats: 36 761 cells, 23 551 wires, 432 public wires; no latches.
+
+### 5.2 Coverage closure (done)
+
+Added `test_phy_error` cocotb test (`verification/cocotb/test_bridge.py`).
+Strategy: issue 4 reads, wait 40 ucie_clk cycles for req_fifo to drain via
+hdr_fire, then inject `link_error=1`.  All FIFOs already empty → `drain_done`
+fires in ~2 clk cycles → `phy_link_ctrl` cycles ACTIVE→ERR_DRAIN→RETRAIN in ~5
+cycles.  Clearing `link_error` (with `phy_init_done` held high) returns to
+ACTIVE; a final `chi_req_ready` acceptance confirms the bridge reopens.
+
+Coverage outcome (merged directed + cocotb, path-normalized):
+- `phy_link_ctrl.v:49` (S_ERR_DRAIN case): 2 hits ✓
+- `chi_to_ucie_bridge.v:200` (SB_MSG_LINK_ERROR branch): 1 hit ✓
+- `chi_to_ucie_bridge.v:202` (SB_MSG_RETRAIN_REQ branch): 1 hit ✓
+- `chi_to_ucie_bridge.v:204` (SB_MSG_LINK_ACTIVE branch): 7 hits ✓
+- Line 51 (`default` in exhaustive 2-bit case) remains 0 — unreachable dead code.
+
+All 4/4 cocotb tests pass: `make SIM=verilator` in `verification/cocotb/`.
+Note: `verilator_coverage --write-info` records cocotb coverage under absolute
+paths and directed-sim coverage under relative paths; the merged `.info` file
+contains both; path-normalized analysis confirms all target lines are hit.
+
+### 5.3 Sideband protocol handler (done)
+
+Replace the inline sideband TX logic with a standalone `src/sb_msg_handler.v`
+module that handles both TX and RX sideband management messages.
+
+**New RX messages** (added to `chi_ucie_bridge_defs.vh`):
+- `SB_MSG_PARAM_REQ  = 0xB0` — PHY queries bridge parameters
+- `SB_MSG_PARAM_ACK  = 0xB1` — bridge responds: byte = max_outstanding[7:0]
+- `SB_MSG_PM_L1_REQ  = 0xD0` — PHY requests power-management L1 entry
+- `SB_MSG_PM_L1_ACK  = 0xD1` — bridge acks L1 (after current transactions drain)
+- `SB_MSG_PM_L1_EXIT = 0xD2` — PHY signals L1 wake; bridge resumes
+
+**PM flow**: on `SB_MSG_PM_L1_REQ`, the handler asserts `pm_l1_active` which
+gates `chi_req_ready` (no new requests accepted).  Once `drain_done` from
+`reset_drain` is high (all FIFOs empty), it sends `SB_MSG_PM_L1_ACK`.  On
+`SB_MSG_PM_L1_EXIT`, `pm_l1_active` is cleared and the bridge re-opens.
+
+**TX priority**: link-state messages (§4.4) take priority over PARAM_ACK; PM
+ack is highest priority because it gates PHY power sequencing.
+
+**New bridge port**: `pm_l1_active` output exposed for system-level monitoring.
+
+**Formal**: new `sb_msg_handler.sby` target proving PM ack only fires after
+drain, `pm_l1_active` is mutually exclusive with `bridge_open`, and PARAM_ACK
+is sent within one cycle of drain after PARAM_REQ.
+
+### 5.4 QoS field routing and observability (done)
+
+Route the CHI REQ `QoS[3:0]` field end-to-end through the adapter and add
+high-priority transaction observability.
+
+- **Header mapping**: `attr[3:0]` in the 128-bit UCIe adapter header (bits
+  `[107:104]`) now carries `chi_req[CHI_REQ_QOS_LSB +: 4]` (was zero).
+  `CHI_REQ_QOS_LSB = 86` (after `TGTID` at bit 79, width 7).
+- **Counter**: `qos_hi_cnt[15:0]` bridge output counts headers issued with
+  QoS≥8; reset on link tear-down (`!bridge_open_ucie`); lives in ucie_clk domain.
+- **Directed TB**: sends a QoS=0xF read, confirms `ucie_tx_hdr[107:104]==0xF`,
+  then waits for `@(posedge ucie_clk); #1` (non-blocking assignment settle)
+  and confirms `qos_hi_cnt` incremented by one.
+- **cocotb**: `test_random_traffic` randomises QoS 0–15 per transaction and
+  checks `attr[3:0]` against the expected value; `CoverGroup("qos_class",
+  ["lo","hi"])` confirms both QoS<8 and QoS≥8 paths are hit.
+- **SVA** (`chi_to_ucie_bridge_sva.sv`): `a_qos_routed` asserts
+  `tx_hdr_valid |-> (tx_hdr[UCIE_ATTR_LSB +: 4] == req_head_qos)` in the
+  ucie_clk domain; all 5 formal targets pass at BMC depth 8.
+
+CI outcome: `make ci` passes — 36 881 cells, no inferred latches.
+
+Note: full per-class reorder buffering (reads overtaking writes) is deferred;
+this phase guarantees QoS observability and correctness of the priority field
+end-to-end without restructuring the single-queue TX path.
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):

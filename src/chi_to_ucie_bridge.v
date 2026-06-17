@@ -69,7 +69,7 @@ module chi_to_ucie_bridge #(
   output wire                     retrain_req,
   output wire [1:0]               link_state,
 
-  // Sideband interface (§4.4)
+  // Sideband interface (§4.4 / §5.3)
   output wire                     sb_tx_valid,
   output wire [7:0]               sb_tx_data,
   input  wire                     sb_tx_ready,
@@ -77,11 +77,16 @@ module chi_to_ucie_bridge #(
   input  wire [7:0]               sb_rx_data,
   output wire                     sb_rx_ready,
 
+  // Power-management L1 gate (§5.3): high from PM_L1_REQ until PM_L1_EXIT.
+  output wire                     pm_l1_active,
+
   input  wire                     err_inj_en,
   output wire                     drain_done,
   output reg  [15:0]              crc_err_cnt,
   output reg  [15:0]              tag_err_cnt,
-  output reg  [15:0]              drain_cnt
+  output reg  [15:0]              drain_cnt,
+  // QoS observability (§5.4): counts UCIe headers issued with CHI QoS >= 8.
+  output reg  [15:0]              qos_hi_cnt
 );
 
   localparam integer LTAG_W = $clog2(MAX_OUTSTANDING);
@@ -178,40 +183,14 @@ module chi_to_ucie_bridge #(
     .drain_done(drain_done)
   );
 
-  // Sideband TX: send one management message per link-state transition.
-  // One pending message at a time; newer events overwrite a queued message.
-  localparam [1:0] PLC_WAIT    = 2'b00;
-  localparam [1:0] PLC_ACTIVE  = 2'b01;
-  localparam [1:0] PLC_ERR_DRN = 2'b10;
-  localparam [1:0] PLC_RETRAIN = 2'b11;
-
-  reg        sb_pending;
-  reg [7:0]  sb_msg_r;
-  reg [1:0]  link_state_q;
-
-  always @(posedge clk or negedge clk_rst_n) begin
-    if (!clk_rst_n) begin
-      sb_pending    <= 1'b0;
-      sb_msg_r      <= 8'h00;
-      link_state_q  <= PLC_WAIT;
-    end else begin
-      link_state_q <= link_state;
-      if (link_state == PLC_ERR_DRN && link_state_q != PLC_ERR_DRN) begin
-        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_LINK_ERROR;
-      end else if (link_state == PLC_RETRAIN && link_state_q != PLC_RETRAIN) begin
-        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_RETRAIN_REQ;
-      end else if (link_state == PLC_ACTIVE && link_state_q != PLC_ACTIVE) begin
-        sb_pending <= 1'b1; sb_msg_r <= SB_MSG_LINK_ACTIVE;
-      end else if (sb_tx_valid && sb_tx_ready) begin
-        sb_pending <= 1'b0;
-      end
-    end
-  end
-
-  assign sb_tx_valid = sb_pending;
-  assign sb_tx_data  = sb_msg_r;
-  // Sideband RX: always accept; management message contents are for the PHY block.
-  assign sb_rx_ready = 1'b1;
+  // Sideband management handler: link-state TX, PARAM exchange, and PM-L1 flow.
+  sb_msg_handler #(.MAX_OUTSTANDING(MAX_OUTSTANDING)) u_sb_handler (
+    .clk(clk), .rst_n(clk_rst_n),
+    .link_state(link_state), .drain_done(drain_done),
+    .sb_tx_valid(sb_tx_valid), .sb_tx_data(sb_tx_data), .sb_tx_ready(sb_tx_ready),
+    .sb_rx_valid(sb_rx_valid), .sb_rx_data(sb_rx_data), .sb_rx_ready(sb_rx_ready),
+    .pm_l1_active(pm_l1_active)
+  );
 
   wire bridge_open_ucie;
   cdc_sync #(.STAGES(2)) u_open_cdc (
@@ -227,9 +206,9 @@ module chi_to_ucie_bridge #(
   wire req_supported    = chi_req_is_write || chi_req_is_read;
 
   assign chi_req_ready = bridge_open && req_supported && !req_w_full &&
-                         (!chi_req_is_write || accept_wr_data);
+                         (!chi_req_is_write || accept_wr_data) && !pm_l1_active;
   assign chi_wr_data_ready = bridge_open && chi_req_valid && chi_req_is_write && !req_w_full &&
-                             !wdat_w_full;
+                             !wdat_w_full && !pm_l1_active;
 
   wire req_w_en = chi_req_valid && chi_req_ready;
   wire wdat_w_en = req_w_en && chi_req_is_write;
@@ -454,7 +433,7 @@ module chi_to_ucie_bridge #(
             UCIE_MSG_MEM_WR : UCIE_MSG_MEM_RD;
       attr = {2'b00,
               chi_req[CHI_REQ_ORDER_LSB +: CHI_REQ_ORDER_W],
-              chi_req[CHI_REQ_MEMATTR_LSB +: CHI_REQ_MEMATTR_W]};
+              chi_req[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W]};  // §5.4: attr[3:0] = QoS
       translate_chi_req_to_ucie = pack_ucie_hdr(
         UCIE_PKT_KIND_AD_REQ,
         msg,
@@ -503,6 +482,17 @@ module chi_to_ucie_bridge #(
   assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag},
                                                  present_seq);
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
+
+  // QoS high-priority counter: increments when a header fires with QoS >= 8.
+  // Resets on link tear-down (bridge_open_ucie deasserted).
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n)
+      qos_hi_cnt <= 16'h0;
+    else if (!bridge_open_ucie)
+      qos_hi_cnt <= 16'h0;
+    else if (hdr_fire && req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8)
+      qos_hi_cnt <= qos_hi_cnt + 1'b1;
+  end
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
   assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},

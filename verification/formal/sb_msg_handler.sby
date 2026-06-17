@@ -1,0 +1,14 @@
+[options]
+mode bmc
+depth 12
+
+[engines]
+smtbmc
+
+[script]
+read_verilog -formal -sv -I. sb_msg_handler.v
+prep -top sb_msg_handler
+
+[files]
+../../src/chi_ucie_bridge_defs.vh
+../../src/sb_msg_handler.v

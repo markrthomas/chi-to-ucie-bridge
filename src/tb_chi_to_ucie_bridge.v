@@ -57,6 +57,8 @@ module tb_chi_to_ucie_bridge;
   reg         sb_rx_valid;
   reg  [7:0]  sb_rx_data;
   wire        sb_rx_ready;
+  wire        pm_l1_active;
+  wire [15:0] qos_hi_cnt;
   reg         err_inj_en;
   wire        drain_done;
   wire [15:0] crc_err_cnt;
@@ -113,7 +115,9 @@ module tb_chi_to_ucie_bridge;
     .sb_rx_valid(sb_rx_valid),
     .sb_rx_data(sb_rx_data),
     .sb_rx_ready(sb_rx_ready),
+    .pm_l1_active(pm_l1_active),
     .err_inj_en(err_inj_en),
+    .qos_hi_cnt(qos_hi_cnt),
     .drain_done(drain_done),
     .crc_err_cnt(crc_err_cnt),
     .tag_err_cnt(tag_err_cnt),
@@ -363,6 +367,35 @@ module tb_chi_to_ucie_bridge;
 
     if (tag_err_cnt !== 16'h0000) begin
       $display("FAIL: unexpected tag_err_cnt=%0d", tag_err_cnt); $finish(1);
+    end
+
+    $display("INFO: QoS field routing - QoS=0xF carried into UCIe attr[3:0]");
+    begin : qos_check
+      reg [15:0] cnt_before;
+      cnt_before = qos_hi_cnt;
+      // Build a read with QoS=0xF in the CHI REQ flit.
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_READNOSNP;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'hC0CA_C0CA_F00D;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hFE;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h12;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h6;
+      chi_req_data[CHI_REQ_QOS_LSB    +: CHI_REQ_QOS_W]    = 4'hF;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      wait (ucie_tx_hdr_valid);
+      #1;
+      if (ucie_tx_hdr[UCIE_ATTR_LSB +: 4] !== 4'hF) begin
+        $display("FAIL: QoS not routed to attr[3:0] (got %h)", ucie_tx_hdr[UCIE_ATTR_LSB +: 4]);
+        $finish(1);
+      end
+      @(posedge ucie_clk); #1;  // let non-blocking assignments settle
+      if (qos_hi_cnt !== cnt_before + 16'h1) begin
+        $display("FAIL: qos_hi_cnt not incremented (was %0d now %0d)", cnt_before, qos_hi_cnt);
+        $finish(1);
+      end
     end
 
     $display("PASS CHI-to-UCIe bridge directed smoke");

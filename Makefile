@@ -18,6 +18,7 @@ BRIDGE_SRCS := \
 	src/credit_pulse_sync.v \
 	src/txn_table.v \
 	src/phy_link_ctrl.v \
+	src/sb_msg_handler.v \
 	src/chi_to_ucie_bridge.v
 
 # Bound concurrent SVA properties, enabled under Verilator's assertion engine.

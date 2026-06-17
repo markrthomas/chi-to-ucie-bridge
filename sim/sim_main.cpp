@@ -38,17 +38,17 @@ int main(int argc, char** argv) {
     dut->ucie_clk = 0;
     dut->rst_n = 0;
     dut->chi_req_valid = 0;
-    zero_wide(dut->chi_req_data, 3);
+    zero_wide(dut->chi_req_data.data(), 3);     // CHI_REQ_W=82b → 3 words
     dut->chi_wr_data_valid = 0;
-    zero_wide(dut->chi_wr_data, 19);
+    zero_wide(dut->chi_wr_data.data(), 19);     // CHI_DAT_W=598b → 19 words
     dut->chi_rsp_ready = 1;
     dut->chi_comp_data_ready = 1;
     dut->ucie_tx_hdr_ready = 1;
     dut->ucie_tx_data_ready = 1;
     dut->ucie_rx_hdr_valid = 0;
-    dut->ucie_rx_hdr = 0;
+    zero_wide(dut->ucie_rx_hdr.data(), 4);      // UCIE_HDR_W=128b → 4 words
     dut->ucie_rx_data_valid = 0;
-    zero_wide(dut->ucie_rx_data, 19);
+    zero_wide(dut->ucie_rx_data.data(), 4);     // UCIE_DATA_W=128b → 4 words
     dut->ucie_rx_hdr_crdt = 0;
     dut->ucie_rx_dat_crdt = 0;
     dut->phy_init_done = 0;

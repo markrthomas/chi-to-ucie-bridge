@@ -124,10 +124,15 @@ localparam [3:0] UCIE_CPL_SC           = 4'h1;
 localparam [3:0] UCIE_CPL_UR           = 4'h2;
 localparam [3:0] UCIE_CPL_CA           = 4'h3;
 
-// ---- UCIe sideband management message codes (§4.4) ----
-localparam [7:0] SB_MSG_LINK_ACTIVE  = 8'hA0;  // bridge entered link-active state
-localparam [7:0] SB_MSG_LINK_ERROR   = 8'hE1;  // bridge detected link error
-localparam [7:0] SB_MSG_RETRAIN_REQ  = 8'hC2;  // bridge requesting PHY retrain
+// ---- UCIe sideband management message codes (§4.4 / §5.3) ----
+localparam [7:0] SB_MSG_LINK_ACTIVE  = 8'hA0;  // bridge → PHY: entered link-active state
+localparam [7:0] SB_MSG_LINK_ERROR   = 8'hE1;  // bridge → PHY: link error detected
+localparam [7:0] SB_MSG_RETRAIN_REQ  = 8'hC2;  // bridge → PHY: requesting retrain
+localparam [7:0] SB_MSG_PARAM_REQ    = 8'hB0;  // PHY → bridge: query bridge parameters
+localparam [7:0] SB_MSG_PARAM_ACK    = 8'hB1;  // bridge → PHY: respond (next byte = max_outstanding)
+localparam [7:0] SB_MSG_PM_L1_REQ   = 8'hD0;  // PHY → bridge: request power-management L1 entry
+localparam [7:0] SB_MSG_PM_L1_ACK   = 8'hD1;  // bridge → PHY: all transactions drained; L1 ack
+localparam [7:0] SB_MSG_PM_L1_EXIT  = 8'hD2;  // PHY → bridge: L1 wake; resume normal operation
 
 // ---- UCIe 128-bit header field positions ----
 localparam integer UCIE_KIND_MSB  = 127;
