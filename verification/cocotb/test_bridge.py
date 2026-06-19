@@ -747,6 +747,18 @@ async def _send_rx_data_burst(dut, flits):
     dut.ucie_rx_data_valid.value = 0
 
 
+async def _send_rx_hdr(dut, hdr, timeout=20):
+    """Helper: drive one UCIe RX header and wait for it to be accepted."""
+    dut.ucie_rx_hdr.value = hdr
+    dut.ucie_rx_hdr_valid.value = 1
+    for _ in range(timeout):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_rx_hdr_ready.value == 1:
+            dut.ucie_rx_hdr_valid.value = 0
+            return
+    raise AssertionError("ucie_rx_hdr_ready never asserted")
+
+
 @cocotb.test(timeout_time=500, timeout_unit="us")
 async def test_sideband_pm_l1(dut):
     """PM L1 flow: PM_IDLE→PM_DRAINING→PM_ACK_PEND→PM_L1→PM_IDLE.
@@ -1271,3 +1283,179 @@ async def test_err_inj(dut):
         f"crc_err_cnt did not increment (before={initial_cnt}, after={new_cnt})"
 
     dut._log.info(f"err_inj: crc_err_cnt {initial_cnt} → {new_cnt}")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_wdat_fifo_full(dut):
+    """Fill the write-data FIFO by stalling UCIe TX data output.
+
+    Covers wdat_w_full: after FIFO_DEPTH=8 writes fill both the req and wdat
+    FIFOs, req headers drain through UCIe TX (ucie_tx_hdr_ready=1) while
+    ucie_tx_data_ready=0 keeps the wdat FIFO full.  A 9th write then sees
+    chi_req_ready=0 because wdat_w_full blocks accept_wr_data even though
+    the req FIFO has space.
+    """
+    await reset_and_open(dut)
+    FIFO_DEPTH = 8
+
+    dut.ucie_tx_hdr_ready.value  = 1   # let req headers drain freely
+    dut.ucie_tx_data_ready.value = 0   # hold wdat FIFO full; no TX data beats fire
+    dut.chi_rsp_ready.value      = 1
+    dut.chi_comp_data_ready.value = 1
+
+    state = dict(headers=0, running=True)
+
+    async def hdr_crdt_returner():
+        while state["running"]:
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1 and dut.ucie_tx_hdr_ready.value == 1:
+                state["headers"] += 1
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+
+    cocotb.start_soon(hdr_crdt_returner())
+
+    # Issue FIFO_DEPTH writes; both req FIFO and wdat FIFO fill atomically.
+    for i in range(FIFO_DEPTH):
+        addr = 0xC000 + i * 64
+        dut.chi_req_data.value      = make_chi_write_req(0x10 + i, addr)
+        dut.chi_wr_data.value       = make_chi_write_data(0x10 + i, data_for(i))
+        dut.chi_req_valid.value     = 1
+        dut.chi_wr_data_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value     = 0
+                dut.chi_wr_data_valid.value = 0
+                break
+        else:
+            assert False, f"write {i} not accepted within timeout"
+
+    # Wait for all FIFO_DEPTH req headers to drain through UCIe TX.
+    # req FIFO drains as hdr_fire fires; wdat FIFO stays full (tx_data_ready=0).
+    for _ in range(2000):
+        await RisingEdge(dut.ucie_clk)
+        if state["headers"] >= FIFO_DEPTH:
+            break
+    state["running"] = False
+    assert state["headers"] >= FIFO_DEPTH, \
+        f"only {state['headers']}/{FIFO_DEPTH} write TX headers observed"
+
+    # CDC settling: req FIFO now empty, wdat FIFO still 8/8.
+    await ClockCycles(dut.clk, 10)
+
+    # 9th write must be blocked by wdat_w_full (accept_wr_data=0 blocks chi_req_ready).
+    dut.chi_req_data.value      = make_chi_write_req(0x20, 0xD000)
+    dut.chi_wr_data.value       = make_chi_write_data(0x20, data_for(0x20))
+    dut.chi_req_valid.value     = 1
+    dut.chi_wr_data_valid.value = 1
+    stalled = True
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            stalled = False
+            break
+    assert stalled, "chi_req_ready asserted despite wdat FIFO full — wdat_w_full not blocking"
+    dut.chi_req_valid.value     = 0
+    dut.chi_wr_data_valid.value = 0
+
+    # Release drain: FIFO_DEPTH bursts × 5 beats = 40 beats; initial dat_crdt=8
+    # handles all 8 bursts without needing credit returns.
+    dut.ucie_tx_data_ready.value = 1
+    await ClockCycles(dut.ucie_clk, 200)
+
+    dut._log.info("wdat FIFO full: chi_req_ready stall verified; wdat_w_full coverage hit")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_rsp_fifo_full(dut):
+    """Fill the RSP FIFO (depth=8) by stalling CHI RSP consumption.
+
+    Covers rsp_w_full: 8 AD_CPL write-completion headers from UCIe fill the
+    RSP async FIFO while chi_rsp_ready=0 prevents drain.  The 9th header sees
+    ucie_rx_hdr_ready=0 because rsp_w_full gates ucie_rx_hdr_ready.
+    """
+    await reset_and_open(dut)
+    FIFO_DEPTH = 8
+
+    dut.ucie_tx_hdr_ready.value  = 1
+    dut.ucie_tx_data_ready.value = 1
+    dut.chi_rsp_ready.value      = 0   # stall RSP FIFO drain
+    dut.chi_comp_data_ready.value = 1
+
+    state = dict(headers=0, tags=[], running=True)
+
+    async def hdr_consumer():
+        """Collect write TX headers and return hdr + dat credits."""
+        while state["running"]:
+            await RisingEdge(dut.ucie_clk)
+            fired_hdr = (dut.ucie_tx_hdr_valid.value == 1
+                         and dut.ucie_tx_hdr_ready.value == 1)
+            fired_dat = (dut.ucie_tx_data_valid.value == 1
+                         and dut.ucie_tx_data_ready.value == 1)
+            dut.ucie_rx_hdr_crdt.value = 1 if fired_hdr else 0
+            dut.ucie_rx_dat_crdt.value = 1 if fired_dat else 0
+            if fired_hdr:
+                hdr = int(dut.ucie_tx_hdr.value)
+                if field(hdr, UCIE_CODE_LSB, 4) == UCIE_MSG_MEM_WR:
+                    state["headers"] += 1
+                    state["tags"].append(field(hdr, UCIE_TAG_LSB, 8))
+
+    cocotb.start_soon(hdr_consumer())
+
+    # Issue FIFO_DEPTH writes; TX headers and data drain freely.
+    for i in range(FIFO_DEPTH):
+        addr = 0xE000 + i * 64
+        dut.chi_req_data.value      = make_chi_write_req(0x30 + i, addr)
+        dut.chi_wr_data.value       = make_chi_write_data(0x30 + i, data_for(i + 8))
+        dut.chi_req_valid.value     = 1
+        dut.chi_wr_data_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value     = 0
+                dut.chi_wr_data_valid.value = 0
+                break
+        else:
+            assert False, f"write {i} not accepted within timeout"
+
+    # Wait for all FIFO_DEPTH write TX headers (needed for txn_table local tags).
+    for _ in range(3000):
+        await RisingEdge(dut.ucie_clk)
+        if state["headers"] >= FIFO_DEPTH:
+            break
+    state["running"] = False
+    assert state["headers"] >= FIFO_DEPTH, \
+        f"only {state['headers']}/{FIFO_DEPTH} write TX headers observed"
+
+    tags = state["tags"][:FIFO_DEPTH]
+
+    # Allow TX data bursts to drain (initial dat_crdt=8 covers all 8 bursts).
+    await ClockCycles(dut.ucie_clk, 150)
+
+    # Send FIFO_DEPTH AD_CPL headers into the RSP FIFO (chi_rsp_ready=0 → no drain).
+    for tag in tags:
+        hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, tag)
+        await _send_rx_hdr(dut, hdr)
+
+    # RSP FIFO now 8/8 full.  Next header must see ucie_rx_hdr_ready=0.
+    dummy_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, 0x00)
+    dut.ucie_rx_hdr.value = dummy_hdr
+    dut.ucie_rx_hdr_valid.value = 1
+    ready_deasserted = False
+    for _ in range(20):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_rx_hdr_ready.value == 0:
+            ready_deasserted = True
+            break
+    dut.ucie_rx_hdr_valid.value = 0
+
+    assert ready_deasserted, \
+        "ucie_rx_hdr_ready did not deassert — RSP FIFO did not fill to depth 8"
+
+    # Drain RSP FIFO.
+    dut.chi_rsp_ready.value = 1
+    await ClockCycles(dut.clk, 50)
+
+    dut._log.info("RSP FIFO full: ucie_rx_hdr_ready stall verified; rsp_w_full coverage hit")
