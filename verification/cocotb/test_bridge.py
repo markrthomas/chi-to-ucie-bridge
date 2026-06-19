@@ -30,6 +30,7 @@ CHI_REQ_WRITENOSNPFULL = 0x1D
 CHI_DAT_DATA_LSB = 0
 CHI_DAT_BE_LSB = 512
 CHI_DAT_POISON_LSB = 576
+CHI_DAT_DATAID_LSB = 577   # 4-bit field after POISON
 CHI_DAT_RESPERR_LSB = 581
 CHI_DAT_TXNID_LSB = 586
 CHI_DAT_OPCODE_LSB = 594
@@ -37,6 +38,14 @@ CHI_DAT_COMPDATA = 0x4
 CHI_DAT_NCBWRDATA = 0x3
 CHI_RESPERR_OK = 0x0
 CHI_RESPERR_DERR = 0x2
+
+# Sideband message codes (mirrors chi_ucie_bridge_defs.vh §5.3)
+SB_MSG_LINK_ACTIVE = 0xA0
+SB_MSG_PARAM_REQ   = 0xB0
+SB_MSG_PARAM_ACK   = 0xB1
+SB_MSG_PM_L1_REQ   = 0xD0
+SB_MSG_PM_L1_ACK   = 0xD1
+SB_MSG_PM_L1_EXIT  = 0xD2
 
 # ---- CHI RSP flit field map ----
 CHI_RSP_TXNID_LSB = 6
@@ -115,15 +124,17 @@ def pack_ucie_hdr(kind, code, tag, addr48=0, length=0, src_id=0, attr=0, flit_se
     return raw | (crc & 0xFFFF)
 
 
-def pack_mem_cpl_burst(tag, data, poison=0, size=6):
+def pack_mem_cpl_burst(tag, data, poison=0, size=6, addr48=0x0000_0000_0040):
     """Returns header + data flits for a MEM_CPL read completion.
 
     size=4 → 1 data beat (16B), size=5 → 2 beats (32B), size=6 → 4 beats (64B).
+    addr48 is placed in the UCIe header address field; addr[4] (bit 36 of header)
+    distinguishes split-completion halves (0=lower, 1=upper).
     """
     length = 1 << size          # byte count
     num_beats = max(1, length >> 4)  # 128-bit data beats
     hdr = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, tag,
-                        0x0000_0000_0040, length & 0xFF, 0x55, (poison << 7), 0)
+                        addr48, length & 0xFF, 0x55, (poison << 7), 0)
     flits = [hdr]
     for i in range(num_beats):
         flits.append((data >> (128 * i)) & ((1 << 128) - 1))
@@ -720,3 +731,543 @@ async def test_phy_error(dut):
     dut._log.info(
         "phy_error OK: ACTIVE→ERR_DRAIN→RETRAIN→ACTIVE verified; bridge reopened"
     )
+
+
+async def _send_rx_data_burst(dut, flits):
+    """Helper: drive a burst of ucie_rx_data flits, waiting for ready each beat."""
+    for flit in flits:
+        dut.ucie_rx_data.value = flit
+        dut.ucie_rx_data_valid.value = 1
+        for _ in range(50):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_rx_data_ready.value == 1:
+                break
+        else:
+            raise AssertionError("ucie_rx_data_ready never asserted")
+    dut.ucie_rx_data_valid.value = 0
+
+
+@cocotb.test(timeout_time=500, timeout_unit="us")
+async def test_sideband_pm_l1(dut):
+    """PM L1 flow: PM_IDLE→PM_DRAINING→PM_ACK_PEND→PM_L1→PM_IDLE.
+
+    Covers sb_msg_handler PM state machine, pm_l1_active, rx_pm_l1_req,
+    rx_pm_l1_exit, and the pm_ack_pend mux path in tx_data_w.
+    drain_done is gated by reset_drain state; we lower phy_init_done to enter
+    S_DRAIN so drain_done asserts (all FIFOs empty → all_empty=1).
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.sb_tx_ready.value = 1
+
+    # Step 1: send PM_L1_REQ → pm_l1_active asserts.
+    await RisingEdge(dut.clk)
+    dut.sb_rx_valid.value = 1
+    dut.sb_rx_data.value = SB_MSG_PM_L1_REQ
+    await RisingEdge(dut.clk)
+    dut.sb_rx_valid.value = 0
+
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        if dut.pm_l1_active.value == 1:
+            break
+    assert dut.pm_l1_active.value == 1, "pm_l1_active did not assert after PM_L1_REQ"
+
+    # Step 2: lower phy_init_done → phy_link_ctrl ACTIVE→WAIT_PHY → reset_drain
+    # S_UP→S_DRAIN; with all FIFOs empty, drain_done=1 immediately.
+    # PM_DRAINING then transitions to PM_ACK_PEND on the next clk edge.
+    dut.phy_init_done.value = 0
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if dut.sb_tx_valid.value == 1 and int(dut.sb_tx_data.value) == SB_MSG_PM_L1_ACK:
+            break
+    assert dut.sb_tx_valid.value == 1, "PM_L1_ACK (sb_tx_valid) not asserted"
+    assert int(dut.sb_tx_data.value) == SB_MSG_PM_L1_ACK, \
+        f"Expected PM_L1_ACK=0x{SB_MSG_PM_L1_ACK:02X}, got 0x{int(dut.sb_tx_data.value):02X}"
+
+    # Allow ACK to fire (sb_tx_ready=1); bridge enters PM_L1.
+    await RisingEdge(dut.clk)
+
+    # Step 3: send PM_L1_EXIT → pm_l1_active deasserts.
+    dut.sb_rx_valid.value = 1
+    dut.sb_rx_data.value = SB_MSG_PM_L1_EXIT
+    await RisingEdge(dut.clk)
+    dut.sb_rx_valid.value = 0
+
+    for _ in range(10):
+        await RisingEdge(dut.clk)
+        if dut.pm_l1_active.value == 0:
+            break
+    assert dut.pm_l1_active.value == 0, "pm_l1_active did not clear after PM_L1_EXIT"
+
+    # Step 4: bring link back up so the bridge re-opens.
+    dut.phy_init_done.value = 1
+    for _ in range(30):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            break
+
+    dut._log.info("PM L1 flow: PM_IDLE→PM_DRAINING→PM_ACK_PEND→PM_L1→PM_IDLE verified")
+
+
+@cocotb.test(timeout_time=500, timeout_unit="us")
+async def test_sideband_param(dut):
+    """PARAM exchange: PARAM_REQ → PARAM_ACK opcode → MAX_OUTSTANDING value byte.
+
+    Covers param_pend, param_phase, param_opcode_pend, param_value_pend,
+    and the SB_MSG_PARAM_ACK mux path in tx_data_w.
+    """
+    await reset_and_open(dut)
+    dut.sb_tx_ready.value = 1
+
+    # Wait for the post-reset LINK_ACTIVE sideband message to flush.
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if dut.sb_tx_valid.value == 0:
+            break
+
+    # Send PARAM_REQ.
+    await RisingEdge(dut.clk)
+    dut.sb_rx_valid.value = 1
+    dut.sb_rx_data.value = SB_MSG_PARAM_REQ
+    await RisingEdge(dut.clk)
+    dut.sb_rx_valid.value = 0
+
+    # Collect the two-byte PARAM_ACK response: opcode (0xB1) then MAX_OUTSTANDING.
+    # With sb_tx_ready=1 both bytes fire on consecutive cycles, so we capture
+    # them in a single pass to avoid missing the value byte.
+    param_bytes = []
+    for _ in range(20):
+        await RisingEdge(dut.clk)
+        if dut.sb_tx_valid.value == 1 and dut.sb_tx_ready.value == 1:
+            param_bytes.append(int(dut.sb_tx_data.value))
+            if len(param_bytes) == 2:
+                break
+
+    assert len(param_bytes) == 2, \
+        f"Expected 2 PARAM_ACK bytes, captured {len(param_bytes)}: {[hex(b) for b in param_bytes]}"
+    assert param_bytes[0] == SB_MSG_PARAM_ACK, \
+        f"First byte: expected 0x{SB_MSG_PARAM_ACK:02X}, got 0x{param_bytes[0]:02X}"
+    assert param_bytes[1] == 32, \
+        f"Second byte (MAX_OUTSTANDING): expected 32, got {param_bytes[1]}"
+
+    dut._log.info("PARAM exchange: PARAM_REQ → PARAM_ACK(0xB1) + 32 verified")
+
+
+@cocotb.test(timeout_time=1, timeout_unit="ms")
+async def test_split_completion(dut):
+    """§6.3 split completion: a 64B read returns as two 32B UCIe MEM_CPLs.
+
+    Covers rx_cpl_is_split, rx_cpl_upper, rx_cpl_frees_tbl, DataID=2 data
+    placement in translate_ucie_data_to_chi (line with {data[255:0], 256'h0}).
+    Lower half: addr[4]=0 → DataID=0; upper half: addr[4]=1 (addr=0x10) → DataID=2.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.chi_comp_data_ready.value = 1
+
+    # Issue a size=6 (64B) read; alloc_is_large=1 for this entry.
+    txnid = 0x55
+    dut.chi_req_data.value = make_chi_read(txnid, 0x4000_0000_0000, size=0x6)
+    dut.chi_req_valid.value = 1
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            dut.chi_req_valid.value = 0
+            break
+    else:
+        assert False, "chi_req_ready never asserted"
+
+    # Capture local tag from UCIe TX header.
+    local_tag = None
+    for _ in range(80):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            local_tag = field(int(dut.ucie_tx_hdr.value), UCIE_TAG_LSB, 8)
+            break
+    assert local_tag is not None, "no UCIe TX header issued for size=6 read"
+
+    dut.ucie_rx_hdr_crdt.value = 1
+    await RisingEdge(dut.ucie_clk)
+    dut.ucie_rx_hdr_crdt.value = 0
+
+    # 256-bit payloads for each half.
+    LOWER = 0xAABB_CCDD_EEFF_0011_2233_4455_6677_8899_A0B0_C0D0_E0F0_0010_2030_4050_6070_8090
+    UPPER = 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0_F0E1_D2C3_B4A5_9687_7869_5A4B_3C2D_1E0F
+
+    # Lower half: length=0x20 (32B, 2 beats), addr[4]=0.
+    await _send_rx_data_burst(dut, pack_mem_cpl_burst(
+        local_tag, LOWER, size=5, addr48=0x0000_0000_0000))
+
+    # Upper half: length=0x20, addr[4]=1 (addr=0x10 sets header bit 36).
+    await _send_rx_data_burst(dut, pack_mem_cpl_burst(
+        local_tag, UPPER, size=5, addr48=0x0000_0000_0010))
+
+    MASK256 = (1 << 256) - 1
+
+    # First CHI CompData: DataID=0, data[255:0] = LOWER.
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_comp_data_valid.value == 1:
+            break
+    assert dut.chi_comp_data_valid.value == 1, "no first CHI CompData (lower split)"
+    dat0 = int(dut.chi_comp_data.value)
+    assert field(dat0, CHI_DAT_TXNID_LSB, 8) == txnid, "TxnID mismatch (lower)"
+    assert field(dat0, CHI_DAT_DATAID_LSB, 4) == 0, \
+        f"Expected DataID=0, got {field(dat0, CHI_DAT_DATAID_LSB, 4)}"
+    got_lower = (dat0 >> CHI_DAT_DATA_LSB) & MASK256
+    assert got_lower == LOWER & MASK256, \
+        f"Lower data mismatch: 0x{got_lower:064x} != 0x{LOWER & MASK256:064x}"
+    await RisingEdge(dut.clk)
+
+    # Second CHI CompData: DataID=2, data[511:256]=UPPER, data[255:0]=0.
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_comp_data_valid.value == 1:
+            break
+    assert dut.chi_comp_data_valid.value == 1, "no second CHI CompData (upper split)"
+    dat2 = int(dut.chi_comp_data.value)
+    assert field(dat2, CHI_DAT_TXNID_LSB, 8) == txnid, "TxnID mismatch (upper)"
+    assert field(dat2, CHI_DAT_DATAID_LSB, 4) == 2, \
+        f"Expected DataID=2, got {field(dat2, CHI_DAT_DATAID_LSB, 4)}"
+    lower256 = (dat2 >> CHI_DAT_DATA_LSB) & MASK256
+    upper256 = (dat2 >> (CHI_DAT_DATA_LSB + 256)) & MASK256
+    assert lower256 == 0, "Lower 256b of DataID=2 flit must be zero"
+    assert upper256 == UPPER & MASK256, \
+        f"Upper data mismatch: 0x{upper256:064x} != 0x{UPPER & MASK256:064x}"
+
+    dut._log.info("split completion: DataID=0 (lower) + DataID=2 (upper) verified")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_txn_table_full(dut):
+    """Fill all 32 txn_table slots; verify ucie_tx_hdr_valid is gated by tbl_full.
+
+    Covers the tbl_full wire in the bridge and the full flag in txn_table.
+    Credits are returned after each header to prevent TX-credit starvation
+    (TX_HDR_CREDITS=8 < MAX_OUTSTANDING=32).
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.chi_comp_data_ready.value = 1
+
+    N = 32  # MAX_OUTSTANDING
+    state = dict(headers=0, running=True)
+
+    async def hdr_crdt_returner():
+        while state["running"]:
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1 and dut.ucie_tx_hdr_ready.value == 1:
+                state["headers"] += 1
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+
+    cocotb.start_soon(hdr_crdt_returner())
+
+    for i in range(N):
+        dut.chi_req_data.value = make_chi_read(i & 0xFF, 0x3000_0000_0000 + i * 64)
+        dut.chi_req_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            assert False, f"read {i} not accepted within timeout"
+
+    # Wait for all N headers to be observed.
+    for _ in range(2000):
+        await RisingEdge(dut.ucie_clk)
+        if state["headers"] >= N:
+            break
+    state["running"] = False
+    assert state["headers"] >= N, f"only {state['headers']}/{N} UCIe headers observed"
+
+    # Provide one extra credit so credit exhaustion cannot explain silence.
+    dut.ucie_rx_hdr_crdt.value = 1
+    await RisingEdge(dut.ucie_clk)
+    dut.ucie_rx_hdr_crdt.value = 0
+    await ClockCycles(dut.ucie_clk, 4)
+
+    # One more read: must not produce a UCIe header (txn_table full).
+    dut.chi_req_data.value = make_chi_read(0xFF, 0x9999_0000_0000)
+    dut.chi_req_valid.value = 1
+    for _ in range(20):
+        await RisingEdge(dut.ucie_clk)
+        assert dut.ucie_tx_hdr_valid.value == 0, \
+            "ucie_tx_hdr_valid asserted with all txn_table slots occupied (tbl_full not gating)"
+    dut.chi_req_valid.value = 0
+
+    dut._log.info(f"txn_table full: {N}/{N} slots occupied, tbl_full gate verified")
+
+
+@cocotb.test(timeout_time=1, timeout_unit="ms")
+async def test_small_completions(dut):
+    """1-beat (size=4/16B) and 2-beat (size=5/32B) MEM_CPL completions.
+
+    Covers the 3'd1 and 3'd2 branches in the rx_dat_full combinational mux
+    inside chi_to_ucie_bridge.v.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.chi_comp_data_ready.value = 1
+
+    async def do_small_read(txnid, size, payload):
+        dut.chi_req_data.value = make_chi_read(txnid, 0x6000_0000_0000 + txnid * 64, size=size)
+        dut.chi_req_valid.value = 1
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            assert False, f"read txnid={txnid} never accepted"
+
+        local_tag = None
+        for _ in range(100):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1:
+                local_tag = field(int(dut.ucie_tx_hdr.value), UCIE_TAG_LSB, 8)
+                break
+        assert local_tag is not None, f"no UCIe TX header for txnid={txnid}"
+
+        dut.ucie_rx_hdr_crdt.value = 1
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_rx_hdr_crdt.value = 0
+
+        await _send_rx_data_burst(dut, pack_mem_cpl_burst(local_tag, payload, size=size))
+
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_comp_data_valid.value == 1:
+                break
+        assert dut.chi_comp_data_valid.value == 1, f"no CHI CompData for txnid={txnid}"
+        dat = int(dut.chi_comp_data.value)
+        assert field(dat, CHI_DAT_TXNID_LSB, 8) == txnid, \
+            f"TxnID mismatch: got 0x{field(dat, CHI_DAT_TXNID_LSB, 8):02X}"
+        nbytes = 1 << size
+        mask = (1 << (nbytes * 8)) - 1
+        got = (dat >> CHI_DAT_DATA_LSB) & mask
+        assert got == payload & mask, \
+            f"size={size} data mismatch: got 0x{got:x}, exp 0x{payload & mask:x}"
+        await RisingEdge(dut.clk)
+
+    await do_small_read(0xC1, 4, 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0)  # 1 beat
+    await do_small_read(0xC2, 5, data_for(0xC002))                            # 2 beats
+
+    dut._log.info("small completions: 1-beat (size=4) and 2-beat (size=5) verified")
+
+
+@cocotb.test(timeout_time=200, timeout_unit="us")
+async def test_tag_error(dut):
+    """MEM_CPL with an unallocated tag increments tag_err_cnt.
+
+    Covers the tag_err output from txn_table and the tag_err_cnt counter
+    in the ucie_clk domain of chi_to_ucie_bridge.
+    """
+    await reset_and_open(dut)
+    dut.chi_comp_data_ready.value = 1
+
+    initial_cnt = int(dut.tag_err_cnt.value)
+
+    # tag=0xFF → lower LTAG_W=5 bits = 0x1F (slot 31, not allocated after reset).
+    await _send_rx_data_burst(dut, pack_mem_cpl_burst(0xFF, 0xDEAD_BEEF_CAFE_BABE))
+
+    await ClockCycles(dut.ucie_clk, 8)
+    new_cnt = int(dut.tag_err_cnt.value)
+    assert new_cnt == initial_cnt + 1, \
+        f"tag_err_cnt did not increment (before={initial_cnt}, after={new_cnt})"
+
+    dut._log.info(f"tag error: tag_err_cnt {initial_cnt} → {new_cnt}")
+
+
+@cocotb.test(timeout_time=500, timeout_unit="us")
+async def test_rx_hdr_bad_crc(dut):
+    """Bad-CRC AD_CPL header increments crc_err_cnt.
+
+    Covers the rx_hdr_bad wire in chi_to_ucie_bridge (the header-channel CRC
+    error path; distinct from rx_dat_bad which test_random_errors covers).
+    """
+    await reset_and_open(dut)
+    dut.chi_rsp_ready.value = 1
+
+    initial_crc = int(dut.crc_err_cnt.value)
+
+    # Build a valid AD_CPL header then corrupt its CRC field.
+    good_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, 0x00)
+    bad_hdr  = good_hdr ^ 0xFFFF   # flip CRC[15:0]
+
+    dut.ucie_rx_hdr.value = bad_hdr
+    dut.ucie_rx_hdr_valid.value = 1
+    for _ in range(20):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_rx_hdr_ready.value == 1:
+            break
+    dut.ucie_rx_hdr_valid.value = 0
+
+    await ClockCycles(dut.ucie_clk, 6)
+    new_crc = int(dut.crc_err_cnt.value)
+    assert new_crc == initial_crc + 1, \
+        f"crc_err_cnt did not increment on bad-CRC AD_CPL (before={initial_crc}, after={new_crc})"
+
+    dut._log.info(f"rx_hdr_bad: crc_err_cnt {initial_crc} → {new_crc}")
+
+
+@cocotb.test(timeout_time=1, timeout_unit="ms")
+async def test_poison_completion(dut):
+    """Poisoned MEM_CPL propagates POISON flag to CHI CompData.
+
+    Covers rx_dat_poison_latched in chi_to_ucie_bridge.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.chi_comp_data_ready.value = 1
+
+    txnid = 0xBB
+    dut.chi_req_data.value = make_chi_read(txnid, 0x7000_0000_0000)
+    dut.chi_req_valid.value = 1
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            dut.chi_req_valid.value = 0
+            break
+    else:
+        assert False, "chi_req_ready never asserted"
+
+    local_tag = None
+    for _ in range(80):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            local_tag = field(int(dut.ucie_tx_hdr.value), UCIE_TAG_LSB, 8)
+            break
+    assert local_tag is not None, "no UCIe TX header"
+
+    dut.ucie_rx_hdr_crdt.value = 1
+    await RisingEdge(dut.ucie_clk)
+    dut.ucie_rx_hdr_crdt.value = 0
+
+    # Return a poisoned completion (poison=1 sets attr[7] in the MEM_CPL header).
+    await _send_rx_data_burst(dut, pack_mem_cpl_burst(local_tag, data_for(0x7000), poison=1))
+
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_comp_data_valid.value == 1:
+            break
+    assert dut.chi_comp_data_valid.value == 1, "no CHI CompData for poisoned completion"
+    dat = int(dut.chi_comp_data.value)
+    poison_bit = field(dat, CHI_DAT_POISON_LSB, 1)
+    assert poison_bit == 1, f"CHI CompData POISON bit not set (got {poison_bit})"
+
+    dut._log.info("poison completion: POISON bit propagated to CHI CompData")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_rdat_fifo_full(dut):
+    """Fill rdat FIFO (depth=8) by stalling CHI CompData consumption.
+
+    Covers rdat_w_full. With chi_comp_data_ready=0, 8 completions fill the FIFO.
+    A 9th completion's last beat stalls (ucie_rx_data_ready=0) until we drain.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value = 1
+    dut.chi_comp_data_ready.value = 0   # stall CHI CompData → FIFO fills
+
+    FIFO_DEPTH = 8
+    state = dict(headers=0, tags=[], running=True)
+
+    async def hdr_consumer():
+        while state["running"]:
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1 and dut.ucie_tx_hdr_ready.value == 1:
+                state["headers"] += 1
+                state["tags"].append(field(int(dut.ucie_tx_hdr.value), UCIE_TAG_LSB, 8))
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+
+    cocotb.start_soon(hdr_consumer())
+
+    # Issue FIFO_DEPTH reads and wait for their headers.
+    for i in range(FIFO_DEPTH):
+        dut.chi_req_data.value = make_chi_read(i & 0xFF, 0x8000_0000_0000 + i * 64)
+        dut.chi_req_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            assert False, f"read {i} not accepted"
+
+    for _ in range(2000):
+        await RisingEdge(dut.ucie_clk)
+        if state["headers"] >= FIFO_DEPTH:
+            break
+    state["running"] = False
+    assert state["headers"] >= FIFO_DEPTH, \
+        f"only {state['headers']}/{FIFO_DEPTH} headers seen"
+
+    tags = state["tags"]
+
+    # Send FIFO_DEPTH completions; each last beat writes one entry → FIFO fills.
+    for tag in tags:
+        await _send_rx_data_burst(dut, pack_mem_cpl_burst(tag, data_for(tag)))
+
+    # FIFO is now full (8/8). Drive a 9th burst beat-by-beat.
+    # Beats 0-3: !rx_dat_last → ucie_rx_data_ready=1 regardless of rdat_w_full.
+    # Beat 4 (last): rdat_w_full=1 → ucie_rx_data_ready=0 → stall until we drain.
+    extra_flits = pack_mem_cpl_burst(tags[0], data_for(0xBEEF))
+    ready_deasserted = False
+    for beat_idx, flit in enumerate(extra_flits):
+        is_last = (beat_idx == len(extra_flits) - 1)
+        dut.ucie_rx_data.value = flit
+        dut.ucie_rx_data_valid.value = 1
+
+        if is_last:
+            # Sample ready before draining to check the stall condition.
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_rx_data_ready.value == 0:
+                ready_deasserted = True
+            # Release the drain so the last beat can complete.
+            dut.chi_comp_data_ready.value = 1
+
+        # Wait for ready (with drain now open it will unblock quickly).
+        for _ in range(100):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_rx_data_ready.value == 1:
+                break
+        else:
+            assert False, f"ucie_rx_data_ready stuck at beat {beat_idx}"
+
+    dut.ucie_rx_data_valid.value = 0
+    await ClockCycles(dut.clk, 20)
+
+    assert ready_deasserted, \
+        "last beat of 9th burst was not stalled — rdat FIFO did not fill to depth 8"
+
+    dut._log.info("rdat FIFO full: last-beat stall observed; rdat_w_full verified")
+
+
+@cocotb.test(timeout_time=200, timeout_unit="us")
+async def test_err_inj(dut):
+    """err_inj_en asserted for one ucie_clk cycle increments crc_err_cnt.
+
+    Covers the err_inj_en input port and the first branch of the crc_err_cnt
+    always block in chi_to_ucie_bridge.
+    """
+    await reset_and_open(dut)
+
+    initial_cnt = int(dut.crc_err_cnt.value)
+
+    await RisingEdge(dut.ucie_clk)
+    dut.err_inj_en.value = 1
+    await RisingEdge(dut.ucie_clk)
+    dut.err_inj_en.value = 0
+
+    await ClockCycles(dut.ucie_clk, 4)
+    new_cnt = int(dut.crc_err_cnt.value)
+    assert new_cnt == initial_cnt + 1, \
+        f"crc_err_cnt did not increment (before={initial_cnt}, after={new_cnt})"
+
+    dut._log.info(f"err_inj: crc_err_cnt {initial_cnt} → {new_cnt}")
