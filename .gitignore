@@ -1,5 +1,8 @@
 sim/obj_dir*/
 sim/coverage.info
+sim/coverage_merged.info
+sim/annotated_cocotb/
+sim/annotated_merged/
 sim/synth.log
 obj_dir*/
 verification/directed/build/
@@ -8,6 +11,8 @@ verification/cocotb/results.xml
 verification/formal/reset_drain/
 verification/formal/txn_table/
 verification/formal/chi_to_ucie_bridge/
+verification/formal/phy_link_ctrl/
+verification/formal/sb_msg_handler/
 *.vcd
 *.fst
 *.log
