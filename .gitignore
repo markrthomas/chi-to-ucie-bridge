@@ -1,8 +1,11 @@
 sim/obj_dir*/
 sim/coverage.info
 sim/coverage_merged.info
+sim/coverage_normalized.info
 sim/annotated_cocotb/
 sim/annotated_merged/
+sim/annotated_all/
+sim/coverage_html/
 sim/synth.log
 obj_dir*/
 verification/directed/build/

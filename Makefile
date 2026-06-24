@@ -27,7 +27,7 @@ SVA_ARGS := --assert +define+BRIDGE_SVA
 COV_DIR  := sim/obj_dir_cov
 COCOTB_COV := verification/cocotb/coverage.dat
 
-.PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all formal synth ci clean
+.PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
 
 help:
 	@echo "chi-to-ucie-bridge - common targets"
@@ -40,8 +40,10 @@ help:
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
 	@echo "  make vlt-gtkwave - make vlt-vcd, then open the Verilator VCD"
 	@echo "  make regress   - lint + sim"
-	@echo "  make coverage      - Verilator coverage + SVA (--assert) run -> sim/coverage.info"
-	@echo "  make coverage-all  - merge directed + cocotb coverage -> sim/coverage_merged.info"
+	@echo "  make coverage          - Verilator coverage + SVA (--assert) run -> sim/coverage.info"
+	@echo "  make coverage-all      - merge directed + cocotb coverage -> sim/coverage_merged.info"
+	@echo "  make coverage-report   - text summary + annotated sources (sim/annotated_merged/)"
+	@echo "  make coverage-html     - HTML report in sim/coverage_html/ (requires genhtml)"
 	@echo "  make formal    - SymbiYosys smoke targets"
 	@echo "  make synth     - Yosys synthesis smoke"
 	@echo "  make clean     - remove generated artifacts"
@@ -108,6 +110,32 @@ coverage-all: coverage
 	verilator_coverage --write-info sim/coverage_merged.info \
 		$(COV_DIR)/coverage.dat $(COCOTB_COV); \
 	echo "[COVERAGE-ALL] sim/coverage_merged.info written (directed + cocotb merged)"
+
+# Normalize the merged .info (deduplicate absolute/relative SF: blocks),
+# print a per-file summary, and write annotated source copies.
+# Does not require genhtml.
+NORM_INFO := sim/coverage_normalized.info
+NORM_PY   := sim/normalize_info.py
+
+coverage-report: coverage-all
+	@set -e; \
+	python3 $(NORM_PY) sim/coverage_merged.info $(NORM_INFO) \
+		--summary --annotate sim/annotated_merged; \
+	echo "[COVERAGE-REPORT] annotated sources in sim/annotated_merged/"
+
+# HTML report via genhtml (lcov package).  Install with: sudo apt install lcov
+coverage-html: coverage-all
+	@set -e; \
+	command -v genhtml >/dev/null 2>&1 || { \
+		echo "[COVERAGE-HTML] genhtml not found; install with: sudo apt install lcov"; \
+		exit 1; \
+	}; \
+	python3 $(NORM_PY) sim/coverage_merged.info $(NORM_INFO); \
+	rm -rf sim/coverage_html; \
+	genhtml $(NORM_INFO) --output-directory sim/coverage_html \
+		--title "chi-to-ucie-bridge" --legend --num-spaces 4 \
+		--prefix $(shell pwd)/src; \
+	echo "[COVERAGE-HTML] report in sim/coverage_html/index.html"
 
 formal:
 	$(MAKE) -C verification/formal
