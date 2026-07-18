@@ -228,13 +228,25 @@ module chi_to_ucie_bridge #(
   wire accept_wr_data   = chi_req_is_write && chi_wr_data_valid && !wdat_w_full;
   wire req_supported    = chi_req_is_write || chi_req_is_read;
 
-  assign chi_req_ready = bridge_open && req_supported && !req_w_full &&
-                         (!chi_req_is_write || accept_wr_data) && !pm_l1_active;
+  // §7.1: an unsupported opcode is accepted and answered with a CHI RSP carrying
+  // RespErr (NDERR) via a local clk-domain error-response FIFO, instead of the
+  // Phase-1 behaviour of stalling chi_req_ready forever (a request-channel
+  // deadlock). A compliant write master never sends WriteData for a rejected
+  // request (it would wait for a DBIDResp we never issue), so the data channel
+  // cannot deadlock either.
+  wire chi_req_is_err = chi_req_valid && !req_supported;
+  wire err_rsp_w_full;
+  wire err_rsp_accept = chi_req_is_err && !err_rsp_w_full;
+
+  assign chi_req_ready = bridge_open && !pm_l1_active &&
+                         ( (req_supported && !req_w_full && (!chi_req_is_write || accept_wr_data))
+                           || err_rsp_accept );
   assign chi_wr_data_ready = bridge_open && chi_req_valid && chi_req_is_write && !req_w_full &&
                              !wdat_w_full && !pm_l1_active;
 
-  wire req_w_en = chi_req_valid && chi_req_ready;
-  wire wdat_w_en = req_w_en && chi_req_is_write;
+  wire req_w_en     = chi_req_valid && chi_req_ready && req_supported;
+  wire wdat_w_en    = req_w_en && chi_req_is_write;
+  wire err_rsp_w_en = chi_req_valid && chi_req_ready && chi_req_is_err;
   // The write's UCIe tag comes from the side-queue at data issue, so the data
   // FIFO carries only the payload.
 
@@ -583,6 +595,23 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
+  // §7.1: build a CHI Comp response carrying RespErr=NDERR for a request the
+  // bridge cannot translate. Identity (TxnID/SrcID) is taken straight from the
+  // rejected request so it routes back to the originating requester.
+  function automatic [CHI_RSP_W-1:0] make_err_rsp;
+    input [CHI_REQ_W-1:0] chi_req;
+    reg [CHI_RSP_W-1:0] rsp;
+    begin
+      rsp = {CHI_RSP_W{1'b0}};
+      rsp[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] = CHI_RESPERR_NDERR;
+      rsp[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W]       = chi_req[CHI_REQ_TXNID_LSB +: CHI_RSP_DBID_W];
+      rsp[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]     = chi_req[CHI_REQ_TXNID_LSB +: TXNID_W];
+      rsp[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W]   = CHI_RSP_COMP;
+      rsp[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W]     = chi_req[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W];
+      make_err_rsp = rsp;
+    end
+  endfunction
+
   function automatic [CHI_DAT_W-1:0] translate_ucie_data_to_chi;
     input [UCIE_HDR_W-1:0] hdr;
     input [511:0]          data;
@@ -622,11 +651,31 @@ module chi_to_ucie_bridge #(
   wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_crc16_ok(ucie_rx_hdr);
   wire rx_dat_bad = rx_dat_fire && (rx_dat_beat_ctr == 3'd0) && !ucie_hdr_crc16_ok(ucie_rx_data);
 
+  // §7.1: local error-response FIFO (clk domain both sides — the rejected request
+  // and its response both live in the CHI clock domain, so no CDC is needed).
+  wire [CHI_RSP_W-1:0] err_rsp_r_data;
+  wire                 err_rsp_r_empty;
+
+  // Arbitrate normal completions (rsp_fifo) with local error responses onto the
+  // single CHI RSP output. Completions take priority; error responses are served
+  // whenever no completion is waiting.
+  assign chi_rsp_valid = !rsp_r_empty || !err_rsp_r_empty;
+  assign chi_rsp_data  = !rsp_r_empty ? rsp_r_data : err_rsp_r_data;
+  wire rsp_pop     = chi_rsp_valid && chi_rsp_ready && !rsp_r_empty;
+  wire err_rsp_pop = chi_rsp_valid && chi_rsp_ready && rsp_r_empty && !err_rsp_r_empty;
+
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
     .w_data(translate_ucie_hdr_to_chi_rsp(ucie_rx_hdr, a_txnid, a_srcid, a_valid)), .w_full(rsp_w_full),
-    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_rsp_valid && chi_rsp_ready),
+    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(rsp_pop),
     .r_data(rsp_r_data), .r_empty(rsp_r_empty)
+  );
+
+  async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_err_rsp_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(err_rsp_w_en),
+    .w_data(make_err_rsp(chi_req_data)), .w_full(err_rsp_w_full),
+    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(err_rsp_pop),
+    .r_data(err_rsp_r_data), .r_empty(err_rsp_r_empty)
   );
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_rdat_fifo (
@@ -636,8 +685,6 @@ module chi_to_ucie_bridge #(
     .r_data(rdat_r_data), .r_empty(rdat_r_empty)
   );
 
-  assign chi_rsp_valid = !rsp_r_empty;
-  assign chi_rsp_data = rsp_r_data;
   assign chi_comp_data_valid = !rdat_r_empty;
   assign chi_comp_data = rdat_r_data;
 

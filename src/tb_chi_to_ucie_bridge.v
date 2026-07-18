@@ -693,6 +693,52 @@ module tb_chi_to_ucie_bridge;
       @(posedge ucie_clk);
     end
 
+    $display("INFO: §7.1 unsupported opcode -> CHI Comp with RespErr=NDERR (no deadlock)");
+    begin : bad_op
+      chi_rsp_ready = 1'b1;
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = 7'h50;  // not read/write
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hBA;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h5A;
+      chi_req_valid = 1'b1;
+      // Must be accepted within a bounded time (the Phase-1 bug stalled forever).
+      fork : accept_watchdog
+        begin
+          while (!chi_req_ready) @(posedge clk);
+          disable accept_watchdog;
+        end
+        begin
+          repeat (64) @(posedge clk);
+          $display("FAIL: §7.1: unsupported opcode never accepted (request-channel deadlock)");
+          $finish(1);
+        end
+      join
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      // No UCIe header must be issued for a rejected request.
+      if (ucie_tx_hdr_valid) begin
+        $display("FAIL: §7.1: rejected opcode issued a UCIe header"); $finish(1);
+      end
+      wait (chi_rsp_valid);
+      if (chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] !== CHI_RSP_COMP) begin
+        $display("FAIL: §7.1: expected CHI Comp for rejected opcode"); $finish(1);
+      end
+      if (chi_rsp_data[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] !== CHI_RESPERR_NDERR) begin
+        $display("FAIL: §7.1: rejected opcode RespErr not NDERR (got %h)",
+                 chi_rsp_data[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W]); $finish(1);
+      end
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hBA) begin
+        $display("FAIL: §7.1: rejected opcode TxnID not echoed (got %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]); $finish(1);
+      end
+      if (chi_rsp_data[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W] !== 7'h5A) begin
+        $display("FAIL: §7.1: rejected opcode SrcID not echoed"); $finish(1);
+      end
+      @(posedge clk);
+      chi_rsp_ready = 1'b0;
+    end
+
     $display("PASS CHI-to-UCIe bridge directed smoke");
     $finish(0);
   end
