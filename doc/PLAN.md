@@ -472,6 +472,86 @@ is consistent with the existing beat-0 header structure.
 - Directed TB: §6.4 test verifies consecutive read-req headers are seq+1, and
   a write's burst header is its req header's seq+1.
 
+### 6.5 cocotb coverage expansion (done)
+
+Added 10 cocotb tests to hit previously zero-coverage paths, raising cocotb-only
+line coverage from 65% to 73%:
+
+- `test_sideband_pm_l1` — PM L1 power-management FSM (`PM_DRAINING` →
+  `PM_ACK_PEND` → `PM_L1` → idle); drives the `sb_rx_valid`/`drain_done` sequence.
+- `test_sideband_param` — `PARAM_REQ`/`PARAM_ACK` exchange; verifies both bytes
+  (opcode + `MAX_OUTSTANDING` value) fire back-to-back.
+- `test_split_completion` — CHI split read-completion (`DataID=0` lower half,
+  `DataID=2` upper half); `addr[4]` distinguishes the halves (§6.3 path).
+- `test_txn_table_full` — fills the 32-entry `txn_table`; verifies `tbl_full`
+  blocks new UCIe TX headers.
+- `test_small_completions` — 1-beat (size=4) and 2-beat (size=5) MEM_CPL bursts;
+  covers `rx_dat_accum` case arms `3'd1` and `3'd2` (§6.1 path).
+- `test_tag_error` — free attempt for an unallocated tag triggers
+  `tag_err`/`tag_err_cnt`.
+- `test_rx_hdr_bad_crc` — bad CRC on an AD_CPL header increments `crc_err_cnt`
+  via `rx_hdr_bad` (distinct from `rx_dat_bad`).
+- `test_poison_completion` — POISON flag in the MEM_CPL beat-0 header propagates
+  to the CHI CompData POISON bit.
+- `test_rdat_fifo_full` — fills the depth-8 rdat FIFO with
+  `chi_comp_data_ready=0`; verifies `ucie_rx_data_ready` deasserts on the 9th
+  burst's last beat.
+- `test_err_inj` — `err_inj_en` pulse increments `crc_err_cnt`.
+
+Per-file coverage after this phase: `txn_table.v` 100%, `async_fifo.v` 100%,
+`sb_msg_handler.v` 98%, `chi_to_ucie_bridge.v` 98%, `phy_link_ctrl.v` 95%,
+`reset_drain.v` 93%.
+
+### 6.6 wdat/rsp FIFO-full backpressure tests (done)
+
+Added `test_wdat_fifo_full` and `test_rsp_fifo_full` to cover the two remaining
+FIFO-full backpressure paths:
+
+- `wdat_w_full` blocking `chi_req_ready` when the write-data FIFO is saturated.
+- `rsp_w_full` deasserting `ucie_rx_hdr_ready` when the RSP async FIFO is
+  saturated with pending write completions.
+
+With proper merging of directed-sim and cocotb `coverage.dat` files, combined
+line coverage is **597/602 = 99.2%** (16/16 cocotb tests pass). The 5 remaining
+misses are all intentional or tool artifacts:
+
+1. Three defensive FSM `default:` arms in exhaustive 2-bit case statements
+   (unreachable by design).
+2. One dead-code accumulator write: `rx_dat_accum[384:511]` is written on RX
+   beat 4, but the 4-beat result uses `ucie_rx_data` directly.
+3. A Verilator instrumentation gap on the inlined `translate_chi_data_to_ucie`
+   beat-4 case arm.
+
+## Tooling & Documentation
+
+### T.1 Documentation refresh (done)
+
+- `README.md` rewritten from the Phase 1 scaffold to the Phase 6 state: updated
+  status, expanded module map (8 → 14 entries), corrected Quick Start targets,
+  128-bit header table with accurate port names, rewritten Known Limits, and the
+  16-test cocotb matrix.
+- `doc/design-spec.md` rewritten to cover the 128-bit header, multi-beat data
+  protocol, credit flow, PHY link controller FSM, sideband handler messages,
+  FIFO backpressure, and current verification/formal/coverage state.
+- `doc/tutorial.md` added: prerequisites, 6-step workflow (sim → cocotb →
+  waveforms → coverage → formal → CI), read/write transaction walk-throughs with
+  RTL references, and a new-test template.
+
+### T.2 Coverage reporting tooling (done)
+
+The merged `.info` from `make coverage-all` contains duplicate `SF:` blocks
+(absolute paths from directed sim, relative from cocotb) that confuse both
+`verilator_coverage --annotate` and `genhtml`, giving wrong counts.
+
+- `sim/normalize_info.py` — resolves all `SF:` paths to absolute form and sums
+  `DA:` hit counts across duplicate blocks into one clean block per file. Also
+  prints a per-file text summary (`--summary`) and writes annotated source
+  copies with inline hit counts (`--annotate <dir>`).
+- `make coverage-report` — normalize + text table + annotated sources
+  (`sim/annotated_merged/`); no extra tools needed.
+- `make coverage-html` — normalize + `genhtml` HTML report
+  (`sim/coverage_html/index.html`); requires `lcov`.
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
