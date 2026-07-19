@@ -190,30 +190,72 @@ module tb_chi_to_ucie_bridge;
     end
   endtask
 
+  // §7.2: two-phase write. Drives the request alone, consumes the DBIDResp to
+  // learn the allocated DBID, then drives WriteData tagged with that DBID.
+  // Wraps the request opcode + BE so both full and partial writes share it.
+  task automatic send_chi_write_op;
+    input [6:0]   opcode;
+    input [7:0]   txnid;
+    input [47:0]  addr;
+    input [511:0] data;
+    input [63:0]  be;
+    input [2:0]   size;
+    reg [CHI_RSP_DBID_W-1:0] dbid;
+    reg saved_rsp_ready;
+    begin
+      // Phase 1: request only (no WriteData yet).
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = opcode;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = addr;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = txnid;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h34;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = size;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+
+      // Consume the DBIDResp deterministically: hold the RSP channel closed so the
+      // DBIDResp (highest arbiter priority) waits at the head, capture it, then
+      // pulse ready once to pop only it. Restore the caller's ready afterward so
+      // the TB's persistent-ready convention for completions is preserved.
+      saved_rsp_ready = chi_rsp_ready;
+      chi_rsp_ready = 1'b0;
+      @(posedge clk);
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_DBIDRESP))
+        @(posedge clk);
+      dbid = chi_rsp_data[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W];
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== txnid) begin
+        $display("FAIL: §7.2: DBIDResp TxnID mismatch (got %h exp %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W], txnid); $finish(1);
+      end
+      chi_rsp_ready = 1'b1;
+      @(posedge clk);
+      chi_rsp_ready = saved_rsp_ready;
+
+      // Phase 2: WriteData tagged with the DBID (echoed in the DAT TxnID field).
+      @(posedge clk);
+      chi_wr_data = {CHI_DAT_W{1'b0}};
+      chi_wr_data[CHI_DAT_OPCODE_LSB  +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
+      chi_wr_data[CHI_DAT_TXNID_LSB   +: CHI_DAT_TXNID_W]  = {{(TXNID_W-CHI_RSP_DBID_W){1'b0}}, dbid};
+      chi_wr_data[CHI_DAT_BE_LSB      +: CHI_DAT_BE_W]     = be;
+      chi_wr_data[CHI_DAT_DATA_LSB    +: CHI_DAT_DATA_W]   = data;
+      chi_wr_data_valid = 1'b1;
+      while (!chi_wr_data_ready) @(posedge clk);
+      @(posedge clk);
+      chi_wr_data_valid = 1'b0;
+    end
+  endtask
+
   task automatic send_chi_write;
     input [7:0]   txnid;
     input [47:0]  addr;
     input [511:0] data;
     input [2:0]   size;
     begin
-      @(posedge clk);
-      chi_req_data = {CHI_REQ_W{1'b0}};
-      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_WRITENOSNPFULL;
-      chi_req_data[CHI_REQ_ADDR_LSB +: CHI_REQ_ADDR_W] = addr;
-      chi_req_data[CHI_REQ_TXNID_LSB +: CHI_REQ_TXNID_W] = txnid;
-      chi_req_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W] = 7'h34;
-      chi_req_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W] = size;
-      chi_wr_data = {CHI_DAT_W{1'b0}};
-      chi_wr_data[CHI_DAT_OPCODE_LSB +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
-      chi_wr_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] = txnid;
-      chi_wr_data[CHI_DAT_BE_LSB +: CHI_DAT_BE_W] = {BE_W{1'b1}};
-      chi_wr_data[CHI_DAT_DATA_LSB +: CHI_DAT_DATA_W] = data;
-      chi_req_valid = 1'b1;
-      chi_wr_data_valid = 1'b1;
-      while (!chi_req_ready) @(posedge clk);
-      @(posedge clk);
-      chi_req_valid = 1'b0;
-      chi_wr_data_valid = 1'b0;
+      send_chi_write_op(CHI_REQ_WRITENOSNPFULL, txnid, addr, data, {BE_W{1'b1}}, size);
     end
   endtask
 
@@ -225,24 +267,7 @@ module tb_chi_to_ucie_bridge;
     input [63:0]  be;
     input [2:0]   size;
     begin
-      @(posedge clk);
-      chi_req_data = {CHI_REQ_W{1'b0}};
-      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_WRITENOSNPPTL;
-      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = addr;
-      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = txnid;
-      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h34;
-      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = size;
-      chi_wr_data = {CHI_DAT_W{1'b0}};
-      chi_wr_data[CHI_DAT_OPCODE_LSB  +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
-      chi_wr_data[CHI_DAT_TXNID_LSB   +: CHI_DAT_TXNID_W]  = txnid;
-      chi_wr_data[CHI_DAT_BE_LSB      +: CHI_DAT_BE_W]     = be;
-      chi_wr_data[CHI_DAT_DATA_LSB    +: CHI_DAT_DATA_W]   = data;
-      chi_req_valid    = 1'b1;
-      chi_wr_data_valid = 1'b1;
-      while (!chi_req_ready) @(posedge clk);
-      @(posedge clk);
-      chi_req_valid    = 1'b0;
-      chi_wr_data_valid = 1'b0;
+      send_chi_write_op(CHI_REQ_WRITENOSNPPTL, txnid, addr, data, be, size);
     end
   endtask
 
@@ -734,6 +759,79 @@ module tb_chi_to_ucie_bridge;
       end
       if (chi_rsp_data[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W] !== 7'h5A) begin
         $display("FAIL: §7.1: rejected opcode SrcID not echoed"); $finish(1);
+      end
+      @(posedge clk);
+      chi_rsp_ready = 1'b0;
+    end
+
+    $display("INFO: §7.2 DBID write handshake: DBIDResp precedes WriteData; no early UCIe issue");
+    begin : dbid_hs
+      reg [CHI_RSP_DBID_W-1:0] hs_dbid;
+      reg [7:0] hs_tag;
+      // Phase 1: write request only (no WriteData).
+      chi_rsp_ready = 1'b0;
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_WRITENOSNPFULL;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'h7777_8888_9999;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'h9E;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h2B;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h6;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      // A DBIDResp must appear, and no UCIe header may issue yet (no WriteData).
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_DBIDRESP))
+        @(posedge clk);
+      hs_dbid = chi_rsp_data[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W];
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'h9E) begin
+        $display("FAIL: §7.2: DBIDResp TxnID mismatch (got %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]); $finish(1);
+      end
+      if (ucie_tx_hdr_valid) begin
+        $display("FAIL: §7.2: UCIe header issued before WriteData was sent"); $finish(1);
+      end
+      chi_rsp_ready = 1'b1;   // pop the DBIDResp
+      @(posedge clk);
+      chi_rsp_ready = 1'b0;
+      // Phase 2: WriteData tagged with the DBID. Stall the UCIe header so the
+      // post-data issue is observable rather than firing in a single cycle.
+      ucie_tx_hdr_ready = 1'b0;
+      @(posedge clk);
+      chi_wr_data = {CHI_DAT_W{1'b0}};
+      chi_wr_data[CHI_DAT_OPCODE_LSB +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
+      chi_wr_data[CHI_DAT_TXNID_LSB  +: CHI_DAT_TXNID_W]  = {{(TXNID_W-CHI_RSP_DBID_W){1'b0}}, hs_dbid};
+      chi_wr_data[CHI_DAT_BE_LSB     +: CHI_DAT_BE_W]     = {BE_W{1'b1}};
+      chi_wr_data[CHI_DAT_DATA_LSB   +: CHI_DAT_DATA_W]   = 512'hFEED_FACE_0000_0001;
+      chi_wr_data_valid = 1'b1;
+      while (!chi_wr_data_ready) @(posedge clk);
+      @(posedge clk);
+      chi_wr_data_valid = 1'b0;
+      // The UCIe write header must now appear (stalled), carrying MEM_WR.
+      wait (ucie_tx_hdr_valid);
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== UCIE_MSG_MEM_WR) begin
+        $display("FAIL: §7.2: expected MEM_WR header after WriteData"); $finish(1);
+      end
+      hs_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      ucie_tx_hdr_ready = 1'b1;   // release header + data burst
+      @(posedge ucie_clk);
+      wait (ucie_tx_data_valid);
+      repeat (6) @(posedge ucie_clk);
+      // Complete via AD_CPL; the Comp must restore the original TxnID 0x9E.
+      chi_rsp_ready = 1'b1;
+      ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, hs_tag,
+                                  48'h0, 8'h00, 8'h55, 8'h00, 8'h00);
+      ucie_rx_hdr_valid = 1'b1;
+      while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk);
+      ucie_rx_hdr_valid = 1'b0;
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_COMP))
+        @(posedge clk);
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'h9E) begin
+        $display("FAIL: §7.2: write Comp TxnID not restored to 0x9E"); $finish(1);
       end
       @(posedge clk);
       chi_rsp_ready = 1'b0;
