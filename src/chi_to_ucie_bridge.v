@@ -729,17 +729,40 @@ module chi_to_ucie_bridge #(
   wire [CHI_RSP_W-1:0] dbid_rsp_r_data;
   wire                 dbid_rsp_r_empty;
 
-  // Arbitrate three RSP sources onto the single CHI RSP output. DBIDResp is served
-  // first so a write master is never starved of the token it needs to send data;
-  // then far-side completions; then error responses. Each source is bounded by the
-  // outstanding writes/completions, so none starves the others indefinitely.
-  assign chi_rsp_valid = !dbid_rsp_r_empty || !rsp_r_empty || !err_rsp_r_empty;
-  assign chi_rsp_data  = !dbid_rsp_r_empty ? dbid_rsp_r_data :
-                         !rsp_r_empty      ? rsp_r_data      : err_rsp_r_data;
-  wire dbid_rsp_pop = chi_rsp_valid && chi_rsp_ready && !dbid_rsp_r_empty;
-  wire rsp_pop      = chi_rsp_valid && chi_rsp_ready &&  dbid_rsp_r_empty && !rsp_r_empty;
-  wire err_rsp_pop  = chi_rsp_valid && chi_rsp_ready &&  dbid_rsp_r_empty &&  rsp_r_empty &&
-                      !err_rsp_r_empty;
+  // Arbitrate three RSP sources: DBIDResp first (starving the write master of its
+  // token would deadlock), then far-side completions, then error responses.
+  //
+  // A pure combinatorial mux violates the CHI valid/stable property: u_dbid_rsp_fifo
+  // uses both ports on clk but still has a 2-cycle gray-code sync latency, so
+  // dbid_rsp_r_empty can fall (new entry visible) while we are presenting a
+  // lower-priority rsp_r_data with chi_rsp_ready=0.  The registered state machine
+  // below latches the winner once per presentation and holds it until accepted.
+  wire any_rsp_avail = !dbid_rsp_r_empty || !rsp_r_empty || !err_rsp_r_empty;
+  reg  [CHI_RSP_W-1:0] rsp_held_data;
+  reg                   rsp_presenting;
+  reg                   rsp_src_dbid;   // 1 → pop u_dbid_rsp_fifo on accept
+  reg                   rsp_src_err;    // 1 → pop u_err_rsp_fifo; 0 → pop u_rsp_fifo
+  always @(posedge clk or negedge clk_rst_n) begin
+    if (!clk_rst_n) begin
+      rsp_presenting <= 1'b0;
+      rsp_src_dbid   <= 1'b0;
+      rsp_src_err    <= 1'b0;
+      rsp_held_data  <= {CHI_RSP_W{1'b0}};
+    end else if (rsp_presenting && chi_rsp_ready) begin
+      rsp_presenting <= 1'b0;
+    end else if (!rsp_presenting && any_rsp_avail) begin
+      rsp_presenting <= 1'b1;
+      rsp_src_dbid   <= !dbid_rsp_r_empty;
+      rsp_src_err    <= dbid_rsp_r_empty && rsp_r_empty;
+      rsp_held_data  <= !dbid_rsp_r_empty ? dbid_rsp_r_data :
+                        !rsp_r_empty      ? rsp_r_data : err_rsp_r_data;
+    end
+  end
+  assign chi_rsp_valid = rsp_presenting;
+  assign chi_rsp_data  = rsp_held_data;
+  wire dbid_rsp_pop = rsp_presenting && chi_rsp_ready &&  rsp_src_dbid;
+  wire rsp_pop      = rsp_presenting && chi_rsp_ready && !rsp_src_dbid && !rsp_src_err;
+  wire err_rsp_pop  = rsp_presenting && chi_rsp_ready && !rsp_src_dbid &&  rsp_src_err;
 
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),

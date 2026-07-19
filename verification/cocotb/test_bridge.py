@@ -763,6 +763,9 @@ async def test_phy_error(dut):
 
 async def _send_rx_data_burst(dut, flits):
     """Helper: drive a burst of ucie_rx_data flits, waiting for ready each beat."""
+    # Burn one ucie_clk edge so the first valid=1 write never races the RTL's
+    # posedge evaluation (same race class as reset_and_open posedge fix).
+    await ClockCycles(dut.ucie_clk, 1)
     for flit in flits:
         dut.ucie_rx_data.value = flit
         dut.ucie_rx_data_valid.value = 1
@@ -777,6 +780,7 @@ async def _send_rx_data_burst(dut, flits):
 
 async def _send_rx_hdr(dut, hdr, timeout=20):
     """Helper: drive one UCIe RX header and wait for it to be accepted."""
+    await ClockCycles(dut.ucie_clk, 1)
     dut.ucie_rx_hdr.value = hdr
     dut.ucie_rx_hdr_valid.value = 1
     for _ in range(timeout):
@@ -904,7 +908,12 @@ async def test_split_completion(dut):
     """
     await reset_and_open(dut)
     dut.ucie_tx_hdr_ready.value = 1
-    dut.chi_comp_data_ready.value = 1
+    # Hold chi_comp_data_ready=0 so entries don't drain from under us before we
+    # can read them.  The u_rdat_fifo is FWFT: with ready=1 the read pointer
+    # advances at the same posedge where valid first asserts, and Verilator VPI
+    # callbacks fire after the NBA update — chi_comp_data then shows the NEXT
+    # slot, not the slot we intended to read.
+    dut.chi_comp_data_ready.value = 0
 
     # Issue a size=6 (64B) read; alloc_is_large=1 for this entry.
     txnid = 0x55
@@ -946,6 +955,7 @@ async def test_split_completion(dut):
     MASK256 = (1 << 256) - 1
 
     # First CHI CompData: DataID=0, data[255:0] = LOWER.
+    # Poll with ready=0 so the entry stays at the head until we've inspected it.
     for _ in range(100):
         await RisingEdge(dut.clk)
         if dut.chi_comp_data_valid.value == 1:
@@ -958,7 +968,10 @@ async def test_split_completion(dut):
     got_lower = (dat0 >> CHI_DAT_DATA_LSB) & MASK256
     assert got_lower == LOWER & MASK256, \
         f"Lower data mismatch: 0x{got_lower:064x} != 0x{LOWER & MASK256:064x}"
+    # Consume the first entry.
+    dut.chi_comp_data_ready.value = 1
     await RisingEdge(dut.clk)
+    dut.chi_comp_data_ready.value = 0
 
     # Second CHI CompData: DataID=2, data[511:256]=UPPER, data[255:0]=0.
     for _ in range(100):
@@ -975,6 +988,8 @@ async def test_split_completion(dut):
     assert lower256 == 0, "Lower 256b of DataID=2 flit must be zero"
     assert upper256 == UPPER & MASK256, \
         f"Upper data mismatch: 0x{upper256:064x} != 0x{UPPER & MASK256:064x}"
+    # Consume the second entry and restore ready.
+    dut.chi_comp_data_ready.value = 1
 
     dut._log.info("split completion: DataID=0 (lower) + DataID=2 (upper) verified")
 

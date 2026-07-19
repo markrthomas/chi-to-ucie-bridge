@@ -552,6 +552,96 @@ The merged `.info` from `make coverage-all` contains duplicate `SF:` blocks
 - `make coverage-html` — normalize + `genhtml` HTML report
   (`sim/coverage_html/index.html`); requires `lcov`.
 
+## Phase 7 — CHI Protocol Deepening (branch: phase7-chi-deepening)
+
+Goal: close the three most significant gaps left after Phase 6 — unsupported
+opcode handling, the CHI two-phase write handshake, and the Verilator
+cocotb/RTL posedge race that caused latent test-suite failures.
+
+### §7.1 Unsupported-opcode error path (done)
+
+CHI requires that any unrecognised REQ opcode receive a Comp with `RespErr=NDERR`
+rather than being silently dropped.  Before this phase the bridge would accept
+the flit but never generate a response, dead-locking the requesting master.
+
+**RTL changes (`src/chi_to_ucie_bridge.v`)**:
+- New `async_fifo` instance `u_err_rsp_fifo` (same-clock, WIDTH=CHI_RSP_W,
+  DEPTH=FIFO_DEPTH) holds pending NDERR responses in the `clk` domain.
+- `chi_req_is_err = !req_supported` — pure opcode decode, not gated on valid
+  (gating is at the accept wire to avoid the valid-dependent-ready race).
+- `err_rsp_accept`, `err_rsp_w_en` push to `u_err_rsp_fifo`; `make_err_rsp`
+  assembles the NDERR Comp from the incoming REQ TxnID/SrcID.
+- `chi_rsp_data` mux extended with `err_rsp_r_data` as lowest-priority source.
+
+**Testbench (`src/tb_chi_to_ucie_bridge.v`)**: `§7.1` directed test block
+sends a reserved opcode and verifies NDERR Comp returns with correct TxnID.
+
+CI outcome: 36 tests pass, 42,279 cells, no latches.
+
+### §7.2 DBID write handshake — two-phase CHI write (done)
+
+CHI writes are two-phase: the target first allocates a DBID and returns
+`DBIDResp`; the master then sends `WriteData` tagged with that DBID.  Before
+this phase the bridge required request + data to arrive simultaneously (a
+non-CHI-compliant shortcut from Phase 1).
+
+**RTL changes (`src/chi_to_ucie_bridge.v`)**:
+- **DBID pool**: `dbid_valid[WBUF-1:0]` + `wpend_req[0:WBUF-1]` track
+  allocated DBIDs and the stored request.  `WBUF = FIFO_DEPTH = 8`.
+  Priority encoder (loop from WBUF-1 down to 0) selects lowest-indexed free
+  slot as `dbid_alloc`.
+- **New FIFO** `u_dbid_rsp_fifo`: both ports on `clk` (same-domain),
+  DEPTH=FIFO_DEPTH.  Holds `DBIDResp` flits while the CHI RSP output is busy.
+- **Capacity-based readies**: `rd_req_ready`, `wr_req_ready`, `err_req_ready`
+  are purely capacity-driven (never gated on `chi_req_valid`) to prevent
+  valid-dependent-ready races.  Accept wires gate on both `valid` and `ready`.
+- **Four-way RSP arbitration with stability latch** (§7.2 + §7.2 fix): a
+  registered `rsp_presenting` state machine latches the winner (data + source)
+  at the start of each presentation and holds it until `chi_rsp_ready` accepts
+  it.  The pure-combinatorial mux violated `(valid && !ready) |=> $stable(data)`
+  because `u_dbid_rsp_fifo`'s 2-cycle gray-code sync can change
+  `dbid_rsp_r_empty` without a pop.
+
+**Testbench (`src/tb_chi_to_ucie_bridge.v`)**: `send_chi_write_op` task
+rewritten for two-phase protocol; §7.2 directed test block.
+
+**cocotb (`verification/cocotb/test_bridge.py`)**: `chi_rsp_sink` in
+`test_random_traffic` dispatches on opcode; `test_wdat_fifo_full` and
+`test_rsp_fifo_full` updated for two-phase writes.
+
+CI outcome: 42,475 cells, no latches; `make ci` passes.
+
+### §7.3 Cocotb/Icarus posedge race fixes (done)
+
+Three latent test-suite failures traced to the same root cause: when a test
+helper (or `reset_and_open`) returns at exactly a `ucie_clk` rising edge, the
+first VPI write races the RTL's `always @(posedge ucie_clk)` evaluation.  The
+RTL evaluates with `valid=0` (write not yet committed); cocotb's `RisingEdge`
+trigger fires at the same posedge and sees `ready=1`, incorrectly concluding
+the beat was accepted.
+
+**Fixes**:
+- `reset_and_open`: `await ClockCycles(dut.ucie_clk, 2)` at the end burns
+  through any in-flight posedge.
+- `_send_rx_data_burst` / `_send_rx_hdr`: `await ClockCycles(dut.ucie_clk, 1)`
+  at the start of each call ensures the first `valid=1` write does not land on
+  a pending posedge.
+- `test_split_completion`: holds `chi_comp_data_ready=0` while inspecting
+  CompData entries.  With `ready=1` always, Verilator's VPI fires after the
+  NBA update (`r_ptr_bin` already advanced) so `chi_comp_data` showed the NEXT
+  slot.  Explicit `ready=1` pulses drain entries one at a time.
+
+**Tests fixed**: `test_tag_error`, `test_rx_hdr_bad_crc`, `test_split_completion`.
+
+**Verification status**: 16/16 cocotb tests pass under both Icarus and
+Verilator (`--assert --coverage`).  The `a_rsp_stable` SVA property (which
+caught the combinatorial mux stability bug) passes under Verilator.
+
+**Coverage** (merged directed-sim + cocotb, Verilator): 668/679 = **98%**
+- 8 misses: 6 declaration lines (Verilator instruments but never "executes"
+  wire/reg declarations) + 2 defensive `default:` arms in exhaustive 2-bit
+  case blocks (unreachable by design).
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
