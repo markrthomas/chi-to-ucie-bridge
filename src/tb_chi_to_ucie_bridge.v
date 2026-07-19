@@ -764,6 +764,74 @@ module tb_chi_to_ucie_bridge;
       chi_rsp_ready = 1'b0;
     end
 
+    $display("INFO: §8 CMO opcodes -> UCIE_PKT_KIND_CMO header + CHI Comp on AD_CPL return");
+    begin : cmo_ops
+      reg [7:0] cmo_tag;
+      // Test all four CMO opcodes in sequence.  Each produces a header-only UCIe
+      // packet; no write data follows.  The far side returns AD_CPL → CHI Comp.
+      integer cmo_i;
+      reg [6:0] cmo_opcodes [0:3];
+      reg [7:0] cmo_txnids  [0:3];
+      begin
+        cmo_opcodes[0] = CHI_REQ_CLEANSHARED;
+        cmo_opcodes[1] = CHI_REQ_CLEANSHAREDPERSIST;
+        cmo_opcodes[2] = CHI_REQ_CLEANINVALID;
+        cmo_opcodes[3] = CHI_REQ_MAKEINVALID;
+        cmo_txnids[0]  = 8'hC0;
+        cmo_txnids[1]  = 8'hC1;
+        cmo_txnids[2]  = 8'hC2;
+        cmo_txnids[3]  = 8'hC3;
+        chi_rsp_ready = 1'b1;
+        for (cmo_i = 0; cmo_i < 4; cmo_i = cmo_i + 1) begin
+          @(posedge clk);
+          chi_req_data = {CHI_REQ_W{1'b0}};
+          chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = cmo_opcodes[cmo_i];
+          chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = cmo_txnids[cmo_i];
+          chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h1C;
+          chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h6;
+          chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'hA000_0000_0040 * (cmo_i + 1);
+          chi_req_valid = 1'b1;
+          while (!chi_req_ready) @(posedge clk);
+          @(posedge clk);
+          chi_req_valid = 1'b0;
+          // UCIe header must be kind=CMO and code=opcode[3:0].
+          wait (ucie_tx_hdr_valid);
+          if (ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_CMO) begin
+            $display("FAIL: §8: CMO 0x%02x: UCIe kind 0x%x != CMO",
+                     cmo_opcodes[cmo_i],
+                     ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB]); $finish(1);
+          end
+          if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== cmo_opcodes[cmo_i][3:0]) begin
+            $display("FAIL: §8: CMO 0x%02x: UCIe code 0x%x != opcode[3:0]",
+                     cmo_opcodes[cmo_i],
+                     ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+          end
+          cmo_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+          @(posedge ucie_clk);
+          // Far side returns AD_CPL; bridge must emit CHI Comp with RespErr=OK.
+          ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, cmo_tag,
+                                      48'h0, 8'h00, 8'h55, 8'h00, 8'h00);
+          ucie_rx_hdr_valid = 1'b1;
+          while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+          @(posedge ucie_clk);
+          ucie_rx_hdr_valid = 1'b0;
+          while (!(chi_rsp_valid &&
+                   chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_COMP))
+            @(posedge clk);
+          if (chi_rsp_data[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] !== CHI_RESPERR_OK) begin
+            $display("FAIL: §8: CMO 0x%02x Comp RespErr not OK", cmo_opcodes[cmo_i]);
+            $finish(1);
+          end
+          if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== cmo_txnids[cmo_i]) begin
+            $display("FAIL: §8: CMO 0x%02x TxnID not echoed", cmo_opcodes[cmo_i]);
+            $finish(1);
+          end
+          @(posedge clk);
+        end
+        chi_rsp_ready = 1'b0;
+      end
+    end
+
     $display("INFO: §7.2 DBID write handshake: DBIDResp precedes WriteData; no early UCIe issue");
     begin : dbid_hs
       reg [CHI_RSP_DBID_W-1:0] hs_dbid;

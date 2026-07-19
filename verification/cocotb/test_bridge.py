@@ -64,13 +64,20 @@ UCIE_ATTR_LSB = 104
 UCIE_ADDR_LSB = 32   # addr[79:32] — LSB stays 32, width is now 48 bits
 UCIE_HDR_MASK = (1 << 128) - 1
 
-UCIE_PKT_KIND_AD_REQ = 0x8
-UCIE_PKT_KIND_AD_CPL = 0x9
+UCIE_PKT_KIND_AD_REQ  = 0x8
+UCIE_PKT_KIND_AD_CPL  = 0x9
 UCIE_PKT_KIND_MEM_CPL = 0xA
-UCIE_MSG_MEM_RD = 0x3
-UCIE_MSG_MEM_WR = 0x4
-UCIE_MSG_MEM_WR_DATA = 0x6
-UCIE_CPL_SC = 0x1
+UCIE_PKT_KIND_CMO     = 0xC
+UCIE_MSG_MEM_RD       = 0x3
+UCIE_MSG_MEM_WR       = 0x4
+UCIE_MSG_MEM_WR_DATA  = 0x6
+UCIE_CPL_SC           = 0x1
+
+# §8: CHI Cache-Maintenance Operation opcodes
+CHI_REQ_CLEANSHARED        = 0x08
+CHI_REQ_CLEANSHAREDPERSIST = 0x11
+CHI_REQ_CLEANINVALID       = 0x09
+CHI_REQ_MAKEINVALID        = 0x0D
 
 MASK512 = (1 << 512) - 1
 
@@ -107,6 +114,17 @@ def make_chi_write_data(txnid, data):
     flit |= ((1 << 64) - 1) << CHI_DAT_BE_LSB
     flit |= (txnid & 0xFF) << CHI_DAT_TXNID_LSB
     flit |= (CHI_DAT_NCBWRDATA & 0xF) << CHI_DAT_OPCODE_LSB
+    return flit
+
+
+def make_chi_cmo(opcode, txnid, addr, srcid=0x12, size=6):
+    """Build a CHI CMO request flit (no write data follows)."""
+    flit = 0
+    flit |= (opcode & 0x7F) << CHI_REQ_OPCODE_LSB
+    flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
+    flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
+    flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
+    flit |= (size  & 0x7)  << CHI_REQ_SIZE_LSB
     return flit
 
 
@@ -1573,3 +1591,85 @@ async def test_rsp_fifo_full(dut):
     await ClockCycles(dut.clk, 50)
 
     dut._log.info("RSP FIFO full: ucie_rx_hdr_ready stall verified; rsp_w_full coverage hit")
+
+
+@cocotb.test(timeout_time=200, timeout_unit="us")
+async def test_cmo_ops(dut):
+    """§8: CMO opcodes translate to UCIE_PKT_KIND_CMO headers and get CHI Comp on AD_CPL.
+
+    CleanShared, CleanSharedPersist, CleanInvalid, and MakeInvalid are each sent as
+    a CHI REQ.  The bridge must accept them (chi_req_ready=1), emit a UCIe header with
+    kind=CMO and code=opcode[3:0], and produce a CHI Comp RSP (RespErr=OK, matching
+    TxnID) when the far side returns an AD_CPL.  No write data burst follows any CMO.
+    """
+    await reset_and_open(dut)
+
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1
+    dut.chi_comp_data_ready.value = 1
+
+    cmo_cases = [
+        (CHI_REQ_CLEANSHARED,        0x20, 0xA000_0000_0000),
+        (CHI_REQ_CLEANSHAREDPERSIST, 0x21, 0xB000_0000_0040),
+        (CHI_REQ_CLEANINVALID,       0x22, 0xC000_0000_0080),
+        (CHI_REQ_MAKEINVALID,        0x23, 0xD000_0000_00C0),
+    ]
+
+    for opcode, txnid, addr in cmo_cases:
+        # Submit CMO REQ
+        await RisingEdge(dut.clk)
+        dut.chi_req_data.value  = make_chi_cmo(opcode, txnid, addr)
+        dut.chi_req_valid.value = 1
+        accepted = False
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                accepted = True
+                break
+        assert accepted, f"CMO 0x{opcode:02x}: chi_req_ready never asserted"
+
+        # Wait for UCIe TX header with kind=CMO
+        tx_tag = None
+        for _ in range(80):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1:
+                hdr = int(dut.ucie_tx_hdr.value)
+                got_kind = field(hdr, UCIE_KIND_LSB, 4)
+                got_code = field(hdr, UCIE_CODE_LSB, 4)
+                assert got_kind == UCIE_PKT_KIND_CMO, \
+                    f"CMO 0x{opcode:02x}: UCIe kind=0x{got_kind:x} want 0x{UCIE_PKT_KIND_CMO:x}"
+                assert got_code == (opcode & 0xF), \
+                    f"CMO 0x{opcode:02x}: UCIe code=0x{got_code:x} want 0x{opcode & 0xF:x}"
+                tx_tag = field(hdr, UCIE_TAG_LSB, 8)
+                dut.ucie_rx_hdr_crdt.value = 1
+                break
+        assert tx_tag is not None, f"CMO 0x{opcode:02x}: no UCIe TX header"
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_rx_hdr_crdt.value = 0
+
+        # Far side returns AD_CPL — bridge produces CHI Comp RSP
+        ad_cpl = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, tx_tag)
+        await _send_rx_hdr(dut, ad_cpl)
+
+        # Verify CHI Comp RSP
+        got_rsp = False
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_rsp_valid.value == 1:
+                rsp = int(dut.chi_rsp_data.value)
+                got_opcode  = field(rsp, CHI_RSP_OPCODE_LSB, 4)
+                got_resperr = field(rsp, CHI_RSP_RESPERR_LSB, 2)
+                got_txnid   = field(rsp, CHI_RSP_TXNID_LSB, 8)
+                assert got_opcode == CHI_RSP_COMP, \
+                    f"CMO 0x{opcode:02x}: RSP opcode=0x{got_opcode:x} want Comp"
+                assert got_resperr == 0, \
+                    f"CMO 0x{opcode:02x}: RespErr=0x{got_resperr:x} want OK"
+                assert got_txnid == txnid, \
+                    f"CMO 0x{opcode:02x}: TxnID=0x{got_txnid:x} want 0x{txnid:x}"
+                got_rsp = True
+                break
+        assert got_rsp, f"CMO 0x{opcode:02x}: no CHI Comp RSP"
+
+    dut._log.info("CMO: CleanShared/CleanSharedPersist/CleanInvalid/MakeInvalid all OK")

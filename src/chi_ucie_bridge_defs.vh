@@ -37,11 +37,15 @@ localparam integer UCIE_DATA_W     = UCIE_HDR_W;   // §4.3: single flit width; 
 localparam integer UCIE_DATA_BEATS = 4;             // data beats per write/read-cpl burst (4 × 128b = 512b)
 
 // ---- CHI opcode model ----
-localparam [6:0] CHI_REQ_READNOSNP       = 7'h04;
-localparam [6:0] CHI_REQ_READONCE        = 7'h03;
-localparam [6:0] CHI_REQ_WRITENOSNPFULL  = 7'h1D;
-localparam [6:0] CHI_REQ_WRITENOSNPPTL   = 7'h1C;
-localparam [6:0] CHI_REQ_WRITEUNIQUEFULL = 7'h19;
+localparam [6:0] CHI_REQ_READNOSNP          = 7'h04;
+localparam [6:0] CHI_REQ_READONCE           = 7'h03;
+localparam [6:0] CHI_REQ_WRITENOSNPFULL     = 7'h1D;
+localparam [6:0] CHI_REQ_WRITENOSNPPTL      = 7'h1C;
+localparam [6:0] CHI_REQ_WRITEUNIQUEFULL    = 7'h19;
+localparam [6:0] CHI_REQ_CLEANSHARED        = 7'h08;
+localparam [6:0] CHI_REQ_CLEANSHAREDPERSIST = 7'h11;
+localparam [6:0] CHI_REQ_CLEANINVALID       = 7'h09;
+localparam [6:0] CHI_REQ_MAKEINVALID        = 7'h0D;
 
 localparam [3:0] CHI_RSP_COMP            = 4'h4;
 localparam [3:0] CHI_RSP_DBIDRESP        = 4'h3;
@@ -113,6 +117,7 @@ localparam integer CHI_DAT_W           = CHI_DAT_OPCODE_LSB  + CHI_DAT_OPCODE_W;
 localparam [3:0] UCIE_PKT_KIND_AD_REQ  = 4'h8;
 localparam [3:0] UCIE_PKT_KIND_AD_CPL  = 4'h9;
 localparam [3:0] UCIE_PKT_KIND_MEM_CPL = 4'ha;
+localparam [3:0] UCIE_PKT_KIND_CMO     = 4'hc;  // §8: header-only cache-maintenance request
 localparam [3:0] UCIE_PKT_KIND_ERROR   = 4'he;
 
 localparam [3:0] UCIE_MSG_MEM_RD       = 4'h3;
@@ -174,6 +179,19 @@ function automatic is_chi_read;
       CHI_REQ_READNOSNP,
       CHI_REQ_READONCE: is_chi_read = 1'b1;
       default:          is_chi_read = 1'b0;
+    endcase
+  end
+endfunction
+
+function automatic is_chi_cmo;
+  input [6:0] opcode;
+  begin
+    case (opcode)
+      CHI_REQ_CLEANSHARED,
+      CHI_REQ_CLEANSHAREDPERSIST,
+      CHI_REQ_CLEANINVALID,
+      CHI_REQ_MAKEINVALID: is_chi_cmo = 1'b1;
+      default:             is_chi_cmo = 1'b0;
     endcase
   end
 endfunction

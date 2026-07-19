@@ -642,6 +642,53 @@ caught the combinatorial mux stability bug) passes under Verilator.
   wire/reg declarations) + 2 defensive `default:` arms in exhaustive 2-bit
   case blocks (unreachable by design).
 
+## Phase 8 — CMO Opcodes (branch: phase7-chi-deepening)
+
+Cache-Maintenance Operations (CMO) are header-only CHI requests with no
+associated write data. The far side performs the CMO and returns a single
+`AD_CPL` header. From the bridge's perspective a CMO is the simplest possible
+transaction: one REQ in, one completion RSP out, no data burst on either
+direction.
+
+### §8 CMO implementation (done)
+
+**Opcodes added** (`src/chi_ucie_bridge_defs.vh`):
+
+| CHI opcode | Value | UCIe code field |
+|:---|:---|:---|
+| `CleanShared` | `7'h08` | `4'h8` |
+| `CleanSharedPersist` | `7'h11` | `4'h1` |
+| `CleanInvalid` | `7'h09` | `4'h9` |
+| `MakeInvalid` | `7'h0D` | `4'hD` |
+
+- New `UCIE_PKT_KIND_CMO = 4'hC` packet kind (header-only).
+- New `is_chi_cmo()` function alongside `is_chi_write()` / `is_chi_read()`.
+
+**RTL changes** (`src/chi_to_ucie_bridge.v`):
+
+- `chi_req_is_cmo` and `cmo_req_ready` wires in the clk domain; `req_supported`
+  updated to include CMOs so they are no longer rejected with NDERR.
+- `cmo_req_accept` OR'd into `req_w_en`; CMO pushes to `u_req_fifo` just like a
+  read (no push to `wdat_fifo`, no `wq_push` — no data burst follows).
+- `req_head_is_cmo` in the ucie_clk domain; `alloc_is_large` updated to
+  `!req_head_is_write && !req_head_is_cmo && (size >= 6)` so CMOs do not trigger
+  the split-completion path (they receive a single `AD_CPL`, not `MEM_CPL`).
+- `translate_chi_req_to_ucie`: CMO branch sets `kind = UCIE_PKT_KIND_CMO` and
+  `code = opcode[3:0]`; non-CMO path unchanged.
+
+**RX path**: `AD_CPL` from the far side flows through the existing `u_rsp_fifo`
+→ `translate_ucie_hdr_to_chi_rsp` path, producing a CHI `Comp` RSP with
+`RespErr=OK`. No new RX-path logic is required.
+
+**Verification**:
+- Directed testbench (`src/tb_chi_to_ucie_bridge.v`): `§8 cmo_ops` block
+  exercises all four opcodes sequentially, checks UCIe header kind/code, sends
+  `AD_CPL`, verifies CHI Comp with RespErr=OK and TxnID echo.
+- cocotb `test_cmo_ops`: same four-opcode sequence under Verilator with SVA
+  assertions enabled. **17/17 PASS** (Verilator).
+- Formal: all 5 SymbiYosys targets pass at BMC depth 8–12.
+- Synth: 42,720 cells (+245 vs Phase 7), no latches.
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):

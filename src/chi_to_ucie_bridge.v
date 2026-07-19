@@ -225,7 +225,8 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   wire chi_req_is_write = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_read  = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire req_supported    = chi_req_is_write || chi_req_is_read;
+  wire chi_req_is_cmo   = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire req_supported    = chi_req_is_write || chi_req_is_read || chi_req_is_cmo;
 
   // §7.1: an unsupported opcode is accepted and answered with a CHI RSP carrying
   // RespErr (NDERR) via a local clk-domain error-response FIFO, instead of the
@@ -270,19 +271,21 @@ module chi_to_ucie_bridge #(
   wire rd_req_ready  = chi_req_is_read  && cap_open && !req_w_full;
   wire wr_req_ready  = chi_req_is_write && cap_open && !dbid_pool_full && !dbid_rsp_w_full;
   wire err_req_ready = chi_req_is_err   && cap_open && !err_rsp_w_full;
+  wire cmo_req_ready = chi_req_is_cmo   && cap_open && !req_w_full;   // §8: CMO, header-only
   wire wr_dat_ready  = wr_dat_hit       && cap_open && !req_w_full && !wdat_w_full;
 
-  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready;
+  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready;
   assign chi_wr_data_ready = wr_dat_ready;
 
   wire rd_req_accept  = chi_req_valid     && rd_req_ready;   // read: single-phase enqueue
   wire wr_req_accept  = chi_req_valid     && wr_req_ready;   // write phase 1: alloc DBID
   wire err_rsp_accept = chi_req_valid     && err_req_ready;  // §7.1 reject
+  wire cmo_req_accept = chi_req_valid     && cmo_req_ready;  // §8 CMO: single-phase enqueue
   wire wr_dat_accept  = chi_wr_data_valid && wr_dat_ready;   // write phase 2: enqueue
 
-  // req_fifo enqueue: reads push their request now; writes push the *stored*
+  // req_fifo enqueue: reads/CMOs push their request now; writes push the *stored*
   // request when their WriteData arrives (so header and data enter together).
-  wire                 req_w_en   = rd_req_accept || wr_dat_accept;
+  wire                 req_w_en   = rd_req_accept || wr_dat_accept || cmo_req_accept;
   wire [CHI_REQ_W-1:0] req_w_data = wr_dat_accept ? wpend_req[wr_dbid] : chi_req_data;
   wire                 wdat_w_en  = wr_dat_accept;
   wire                 err_rsp_w_en  = err_rsp_accept;
@@ -318,6 +321,7 @@ module chi_to_ucie_bridge #(
   // Transaction table (ucie_clk domain)
   // ---------------------------------------------------------------------------
   wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire                req_head_is_cmo   = is_chi_cmo(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire [LTAG_W-1:0]   free_tag;
   wire                tbl_full;
   wire                tbl_tag_err;
@@ -423,7 +427,7 @@ module chi_to_ucie_bridge #(
     .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
     .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
     .alloc_is_write(req_head_is_write),
-    .alloc_is_large(!req_head_is_write &&
+    .alloc_is_large(!req_head_is_write && !req_head_is_cmo &&
                     (req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W] >= 3'd6)),
     .free_tag(free_tag),
     .full(tbl_full),
@@ -547,17 +551,27 @@ module chi_to_ucie_bridge #(
     input [CHI_REQ_W-1:0] chi_req;
     input [7:0]           local_tag;
     input [7:0]           flit_seq;
-    reg [3:0] msg;
+    reg [3:0] kind;
+    reg [3:0] code;
     reg [7:0] attr;
     begin
-      msg = is_chi_write(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]) ?
-            UCIE_MSG_MEM_WR : UCIE_MSG_MEM_RD;
+      // §8: CMO → UCIE_PKT_KIND_CMO; code carries the lower 4 bits of the CHI
+      // opcode (CleanShared=0x8, CleanInvalid=0x9, MakeInvalid=0xD,
+      // CleanSharedPersist=0x1). No data burst follows; far side returns AD_CPL.
+      if (is_chi_cmo(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W])) begin
+        kind = UCIE_PKT_KIND_CMO;
+        code = chi_req[CHI_REQ_OPCODE_LSB +: 4];
+      end else begin
+        kind = UCIE_PKT_KIND_AD_REQ;
+        code = is_chi_write(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]) ?
+               UCIE_MSG_MEM_WR : UCIE_MSG_MEM_RD;
+      end
       attr = {2'b00,
               chi_req[CHI_REQ_ORDER_LSB +: CHI_REQ_ORDER_W],
               chi_req[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W]};  // §5.4: attr[3:0] = QoS
       translate_chi_req_to_ucie = pack_ucie_hdr(
-        UCIE_PKT_KIND_AD_REQ,
-        msg,
+        kind,
+        code,
         local_tag,
         chi_req[CHI_REQ_ADDR_LSB +: 48],
         {5'b0, chi_req[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W]},
