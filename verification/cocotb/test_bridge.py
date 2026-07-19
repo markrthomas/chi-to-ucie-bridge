@@ -48,9 +48,13 @@ SB_MSG_PM_L1_ACK   = 0xD1
 SB_MSG_PM_L1_EXIT  = 0xD2
 
 # ---- CHI RSP flit field map ----
-CHI_RSP_TXNID_LSB = 6
+CHI_RSP_RESPERR_LSB = 0
+CHI_RSP_DBID_LSB   = 2
+CHI_RSP_DBID_W     = 4
+CHI_RSP_TXNID_LSB  = 6
 CHI_RSP_OPCODE_LSB = 14
-CHI_RSP_COMP = 0x4
+CHI_RSP_COMP     = 0x4
+CHI_RSP_DBIDRESP = 0x3
 
 # ---- UCIe 128-bit header field positions (bit offsets within the header) ----
 UCIE_KIND_LSB = 124
@@ -187,6 +191,11 @@ async def reset_and_open(dut):
     dut.rst_n.value = 1
     dut.phy_init_done.value = 1
     await ClockCycles(dut.clk, 16)
+    # Consume any in-flight ucie_clk posedge so we return between edges.
+    # Without this, reset_and_open can return exactly on a ucie_clk rising
+    # edge; the first signal write in the next test then races the RTL's
+    # posedge evaluation and the first data beat is silently dropped.
+    await ClockCycles(dut.ucie_clk, 2)
 
 
 @cocotb.test(timeout_time=50, timeout_unit="us")
@@ -289,6 +298,7 @@ async def test_random_traffic(dut):
     pend_hdr_crdts = [0]          # TX header credits to return to bridge
     pend_dat_crdts = [0]          # TX data credits to return to bridge
     exp_qos_by_addr = {}          # addr16 -> expected UCIe attr[3:0] (= CHI QoS)
+    dbid_pending = {}             # txnid -> DBID captured from DBIDResp (§7.2)
 
     N = 80
     MAX_INFLIGHT = 12
@@ -415,18 +425,23 @@ async def test_random_traffic(dut):
                 dut.ucie_rx_dat_crdt.value = 0
             await RisingEdge(dut.ucie_clk)
 
-    # ---- CHI RSP sink: write completions ----
+    # ---- CHI RSP sink: DBIDResps (§7.2) and write completions ----
     async def chi_rsp_sink():
         while state["running"]:
             dut.chi_rsp_ready.value = rdy()
             await RisingEdge(dut.clk)
             if dut.chi_rsp_ready.value == 1 and dut.chi_rsp_valid.value == 1:
-                rsp = int(dut.chi_rsp_data.value)
-                assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_COMP
-                txnid = field(rsp, CHI_RSP_TXNID_LSB, 8)
-                sb.complete_write(txnid)
-                cov_cpl.hit("comp")
-                inuse.discard(txnid)
+                rsp    = int(dut.chi_rsp_data.value)
+                opcode = field(rsp, CHI_RSP_OPCODE_LSB, 4)
+                txnid  = field(rsp, CHI_RSP_TXNID_LSB,  8)
+                if opcode == CHI_RSP_DBIDRESP:
+                    dbid_pending[txnid] = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+                elif opcode == CHI_RSP_COMP:
+                    sb.complete_write(txnid)
+                    cov_cpl.hit("comp")
+                    inuse.discard(txnid)
+                else:
+                    sb.errors.append(f"unexpected RSP opcode 0x{opcode:X} txnid=0x{txnid:X}")
 
     # ---- CHI CompData sink: read completions ----
     async def chi_comp_sink():
@@ -469,20 +484,33 @@ async def test_random_traffic(dut):
 
         if is_write:
             dut.chi_req_data.value = make_chi_write_req(txnid, addr, qos=qos)
-            dut.chi_wr_data.value = make_chi_write_data(txnid, data_for(addr & 0xFFFF))
-            dut.chi_req_valid.value = 1
-            dut.chi_wr_data_valid.value = 1
         else:
             dut.chi_req_data.value = make_chi_read(txnid, addr, qos=qos)
-            dut.chi_req_valid.value = 1
+        dut.chi_req_valid.value = 1
 
-        # hold until accepted
+        # §7.2 phase 1: wait for req accepted
         while True:
             await RisingEdge(dut.clk)
             if dut.chi_req_ready.value == 1:
                 break
         dut.chi_req_valid.value = 0
-        dut.chi_wr_data_valid.value = 0
+
+        if is_write:
+            # §7.2 phase 2: wait for DBIDResp (chi_rsp_sink captures it), then send WriteData
+            for _ in range(400):
+                await RisingEdge(dut.clk)
+                if txnid in dbid_pending:
+                    break
+            else:
+                raise AssertionError(f"DBIDResp never received for txnid=0x{txnid:X}")
+            dbid = dbid_pending.pop(txnid)
+            dut.chi_wr_data.value = make_chi_write_data(dbid, data_for(addr & 0xFFFF))
+            dut.chi_wr_data_valid.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if dut.chi_wr_data_ready.value == 1:
+                    break
+            dut.chi_wr_data_valid.value = 0
 
     # ---- Drain ----
     for _ in range(4000):
@@ -735,6 +763,9 @@ async def test_phy_error(dut):
 
 async def _send_rx_data_burst(dut, flits):
     """Helper: drive a burst of ucie_rx_data flits, waiting for ready each beat."""
+    # Burn one ucie_clk edge so the first valid=1 write never races the RTL's
+    # posedge evaluation (same race class as reset_and_open posedge fix).
+    await ClockCycles(dut.ucie_clk, 1)
     for flit in flits:
         dut.ucie_rx_data.value = flit
         dut.ucie_rx_data_valid.value = 1
@@ -749,6 +780,7 @@ async def _send_rx_data_burst(dut, flits):
 
 async def _send_rx_hdr(dut, hdr, timeout=20):
     """Helper: drive one UCIe RX header and wait for it to be accepted."""
+    await ClockCycles(dut.ucie_clk, 1)
     dut.ucie_rx_hdr.value = hdr
     dut.ucie_rx_hdr_valid.value = 1
     for _ in range(timeout):
@@ -876,7 +908,12 @@ async def test_split_completion(dut):
     """
     await reset_and_open(dut)
     dut.ucie_tx_hdr_ready.value = 1
-    dut.chi_comp_data_ready.value = 1
+    # Hold chi_comp_data_ready=0 so entries don't drain from under us before we
+    # can read them.  The u_rdat_fifo is FWFT: with ready=1 the read pointer
+    # advances at the same posedge where valid first asserts, and Verilator VPI
+    # callbacks fire after the NBA update — chi_comp_data then shows the NEXT
+    # slot, not the slot we intended to read.
+    dut.chi_comp_data_ready.value = 0
 
     # Issue a size=6 (64B) read; alloc_is_large=1 for this entry.
     txnid = 0x55
@@ -918,6 +955,7 @@ async def test_split_completion(dut):
     MASK256 = (1 << 256) - 1
 
     # First CHI CompData: DataID=0, data[255:0] = LOWER.
+    # Poll with ready=0 so the entry stays at the head until we've inspected it.
     for _ in range(100):
         await RisingEdge(dut.clk)
         if dut.chi_comp_data_valid.value == 1:
@@ -930,7 +968,10 @@ async def test_split_completion(dut):
     got_lower = (dat0 >> CHI_DAT_DATA_LSB) & MASK256
     assert got_lower == LOWER & MASK256, \
         f"Lower data mismatch: 0x{got_lower:064x} != 0x{LOWER & MASK256:064x}"
+    # Consume the first entry.
+    dut.chi_comp_data_ready.value = 1
     await RisingEdge(dut.clk)
+    dut.chi_comp_data_ready.value = 0
 
     # Second CHI CompData: DataID=2, data[511:256]=UPPER, data[255:0]=0.
     for _ in range(100):
@@ -947,6 +988,8 @@ async def test_split_completion(dut):
     assert lower256 == 0, "Lower 256b of DataID=2 flit must be zero"
     assert upper256 == UPPER & MASK256, \
         f"Upper data mismatch: 0x{upper256:064x} != 0x{UPPER & MASK256:064x}"
+    # Consume the second entry and restore ready.
+    dut.chi_comp_data_ready.value = 1
 
     dut._log.info("split completion: DataID=0 (lower) + DataID=2 (upper) verified")
 
@@ -1289,18 +1332,18 @@ async def test_err_inj(dut):
 async def test_wdat_fifo_full(dut):
     """Fill the write-data FIFO by stalling UCIe TX data output.
 
-    Covers wdat_w_full: after FIFO_DEPTH=8 writes fill both the req and wdat
-    FIFOs, req headers drain through UCIe TX (ucie_tx_hdr_ready=1) while
-    ucie_tx_data_ready=0 keeps the wdat FIFO full.  A 9th write then sees
-    chi_req_ready=0 because wdat_w_full blocks accept_wr_data even though
-    the req FIFO has space.
+    §7.2 two-phase write protocol: FIFO_DEPTH write requests are accepted and
+    answered with DBIDResps. After consuming those DBIDResps, FIFO_DEPTH WriteData
+    packets fill the wdat FIFO while ucie_tx_data_ready=0. Request headers drain
+    freely (ucie_tx_hdr_ready=1). A 9th WriteData is then blocked by wdat_w_full
+    (chi_wr_data_ready=0); releasing tx_data_ready unblocks it.
     """
     await reset_and_open(dut)
     FIFO_DEPTH = 8
 
-    dut.ucie_tx_hdr_ready.value  = 1   # let req headers drain freely
-    dut.ucie_tx_data_ready.value = 0   # hold wdat FIFO full; no TX data beats fire
-    dut.chi_rsp_ready.value      = 1
+    dut.ucie_tx_hdr_ready.value   = 1   # let req headers drain freely
+    dut.ucie_tx_data_ready.value  = 0   # keep wdat FIFO full; no TX data beats fire
+    dut.chi_rsp_ready.value       = 0   # hold DBIDResps for batch capture below
     dut.chi_comp_data_ready.value = 1
 
     state = dict(headers=0, running=True)
@@ -1316,24 +1359,51 @@ async def test_wdat_fifo_full(dut):
 
     cocotb.start_soon(hdr_crdt_returner())
 
-    # Issue FIFO_DEPTH writes; both req FIFO and wdat FIFO fill atomically.
+    # Phase 1: issue FIFO_DEPTH write requests (no WriteData yet).
     for i in range(FIFO_DEPTH):
-        addr = 0xC000 + i * 64
-        dut.chi_req_data.value      = make_chi_write_req(0x10 + i, addr)
-        dut.chi_wr_data.value       = make_chi_write_data(0x10 + i, data_for(i))
-        dut.chi_req_valid.value     = 1
-        dut.chi_wr_data_valid.value = 1
+        dut.chi_req_data.value = make_chi_write_req(0x10 + i, 0xC000 + i * 64)
+        dut.chi_req_valid.value = 1
         for _ in range(300):
             await RisingEdge(dut.clk)
             if dut.chi_req_ready.value == 1:
-                dut.chi_req_valid.value     = 0
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            assert False, f"write request {i} not accepted within timeout"
+
+    # Consume all FIFO_DEPTH DBIDResps (chi_rsp_ready=1 momentarily).
+    dbid_by_txnid = {}
+    consumed = 0
+    dut.chi_rsp_ready.value = 1
+    for _ in range(500):
+        await RisingEdge(dut.clk)
+        if dut.chi_rsp_valid.value == 1 and dut.chi_rsp_ready.value == 1:
+            rsp    = int(dut.chi_rsp_data.value)
+            opcode = field(rsp, CHI_RSP_OPCODE_LSB, 4)
+            assert opcode == CHI_RSP_DBIDRESP, f"Expected DBIDResp got opcode 0x{opcode:X}"
+            txnid  = field(rsp, CHI_RSP_TXNID_LSB, 8)
+            dbid   = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+            dbid_by_txnid[txnid] = dbid
+            consumed += 1
+            if consumed == FIFO_DEPTH:
+                break
+    dut.chi_rsp_ready.value = 0
+    assert consumed == FIFO_DEPTH, f"Only {consumed}/{FIFO_DEPTH} DBIDResps received"
+
+    # Phase 2: send FIFO_DEPTH WriteData packets (fills req FIFO + wdat FIFO).
+    for i in range(FIFO_DEPTH):
+        dbid = dbid_by_txnid[0x10 + i]
+        dut.chi_wr_data.value     = make_chi_write_data(dbid, data_for(i))
+        dut.chi_wr_data_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_wr_data_ready.value == 1:
                 dut.chi_wr_data_valid.value = 0
                 break
         else:
-            assert False, f"write {i} not accepted within timeout"
+            assert False, f"WriteData {i} not accepted within timeout"
 
-    # Wait for all FIFO_DEPTH req headers to drain through UCIe TX.
-    # req FIFO drains as hdr_fire fires; wdat FIFO stays full (tx_data_ready=0).
+    # Wait for all FIFO_DEPTH req headers to drain (wdat FIFO stays full).
     for _ in range(2000):
         await RisingEdge(dut.ucie_clk)
         if state["headers"] >= FIFO_DEPTH:
@@ -1345,27 +1415,47 @@ async def test_wdat_fifo_full(dut):
     # CDC settling: req FIFO now empty, wdat FIFO still 8/8.
     await ClockCycles(dut.clk, 10)
 
-    # 9th write must be blocked by wdat_w_full (accept_wr_data=0 blocks chi_req_ready).
-    dut.chi_req_data.value      = make_chi_write_req(0x20, 0xD000)
-    dut.chi_wr_data.value       = make_chi_write_data(0x20, data_for(0x20))
-    dut.chi_req_valid.value     = 1
+    # 9th write request: accepted (DBID pool has free slots now).
+    dut.chi_req_data.value  = make_chi_write_req(0x20, 0xD000)
+    dut.chi_req_valid.value = 1
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            dut.chi_req_valid.value = 0
+            break
+    else:
+        assert False, "9th write request not accepted"
+
+    # Consume 9th DBIDResp.
+    dbid9 = None
+    dut.chi_rsp_ready.value = 1
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_rsp_valid.value == 1:
+            rsp = int(dut.chi_rsp_data.value)
+            if field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_DBIDRESP:
+                dbid9 = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+                break
+    dut.chi_rsp_ready.value = 0
+    assert dbid9 is not None, "9th DBIDResp not seen"
+
+    # 9th WriteData must be stalled (wdat_w_full=1 blocks chi_wr_data_ready).
+    dut.chi_wr_data.value       = make_chi_write_data(dbid9, data_for(0x20))
     dut.chi_wr_data_valid.value = 1
     stalled = True
     for _ in range(20):
         await RisingEdge(dut.clk)
-        if dut.chi_req_ready.value == 1:
+        if dut.chi_wr_data_ready.value == 1:
             stalled = False
             break
-    assert stalled, "chi_req_ready asserted despite wdat FIFO full — wdat_w_full not blocking"
-    dut.chi_req_valid.value     = 0
+    assert stalled, "chi_wr_data_ready asserted despite wdat FIFO full — wdat_w_full not blocking"
     dut.chi_wr_data_valid.value = 0
 
-    # Release drain: FIFO_DEPTH bursts × 5 beats = 40 beats; initial dat_crdt=8
-    # handles all 8 bursts without needing credit returns.
+    # Release drain; initial dat_crdt=8 covers all 8 pending bursts.
     dut.ucie_tx_data_ready.value = 1
     await ClockCycles(dut.ucie_clk, 200)
 
-    dut._log.info("wdat FIFO full: chi_req_ready stall verified; wdat_w_full coverage hit")
+    dut._log.info("wdat FIFO full: chi_wr_data_ready stall verified; wdat_w_full coverage hit")
 
 
 @cocotb.test(timeout_time=2, timeout_unit="ms")
@@ -1375,13 +1465,16 @@ async def test_rsp_fifo_full(dut):
     Covers rsp_w_full: 8 AD_CPL write-completion headers from UCIe fill the
     RSP async FIFO while chi_rsp_ready=0 prevents drain.  The 9th header sees
     ucie_rx_hdr_ready=0 because rsp_w_full gates ucie_rx_hdr_ready.
+
+    §7.2: chi_rsp_ready must be 1 while setting up writes so DBIDResps can flow.
+    It is stalled only after all 8 writes are in flight and TX headers observed.
     """
     await reset_and_open(dut)
     FIFO_DEPTH = 8
 
-    dut.ucie_tx_hdr_ready.value  = 1
-    dut.ucie_tx_data_ready.value = 1
-    dut.chi_rsp_ready.value      = 0   # stall RSP FIFO drain
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1   # must be 1 during write setup for DBIDResps
     dut.chi_comp_data_ready.value = 1
 
     state = dict(headers=0, tags=[], running=True)
@@ -1404,21 +1497,39 @@ async def test_rsp_fifo_full(dut):
 
     cocotb.start_soon(hdr_consumer())
 
-    # Issue FIFO_DEPTH writes; TX headers and data drain freely.
+    # §7.2 two-phase writes: phase 1 (req) → consume DBIDResp → phase 2 (WriteData).
     for i in range(FIFO_DEPTH):
         addr = 0xE000 + i * 64
-        dut.chi_req_data.value      = make_chi_write_req(0x30 + i, addr)
-        dut.chi_wr_data.value       = make_chi_write_data(0x30 + i, data_for(i + 8))
-        dut.chi_req_valid.value     = 1
-        dut.chi_wr_data_valid.value = 1
+        dut.chi_req_data.value  = make_chi_write_req(0x30 + i, addr)
+        dut.chi_req_valid.value = 1
         for _ in range(300):
             await RisingEdge(dut.clk)
             if dut.chi_req_ready.value == 1:
-                dut.chi_req_valid.value     = 0
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            assert False, f"write request {i} not accepted within timeout"
+
+        # Wait for DBIDResp (chi_rsp_ready=1 so it flows through immediately).
+        dbid = None
+        for _ in range(200):
+            await RisingEdge(dut.clk)
+            if dut.chi_rsp_valid.value == 1 and dut.chi_rsp_ready.value == 1:
+                rsp = int(dut.chi_rsp_data.value)
+                if field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_DBIDRESP:
+                    dbid = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+                    break
+        assert dbid is not None, f"DBIDResp for write {i} not received"
+
+        dut.chi_wr_data.value       = make_chi_write_data(dbid, data_for(i + 8))
+        dut.chi_wr_data_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_wr_data_ready.value == 1:
                 dut.chi_wr_data_valid.value = 0
                 break
         else:
-            assert False, f"write {i} not accepted within timeout"
+            assert False, f"WriteData {i} not accepted within timeout"
 
     # Wait for all FIFO_DEPTH write TX headers (needed for txn_table local tags).
     for _ in range(3000):
@@ -1433,6 +1544,9 @@ async def test_rsp_fifo_full(dut):
 
     # Allow TX data bursts to drain (initial dat_crdt=8 covers all 8 bursts).
     await ClockCycles(dut.ucie_clk, 150)
+
+    # Now stall RSP drain so the FIFO can fill with AD_CPL completions.
+    dut.chi_rsp_ready.value = 0
 
     # Send FIFO_DEPTH AD_CPL headers into the RSP FIFO (chi_rsp_ready=0 → no drain).
     for tag in tags:

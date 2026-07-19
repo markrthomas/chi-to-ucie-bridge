@@ -225,21 +225,85 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   wire chi_req_is_write = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_read  = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire accept_wr_data   = chi_req_is_write && chi_wr_data_valid && !wdat_w_full;
   wire req_supported    = chi_req_is_write || chi_req_is_read;
 
-  assign chi_req_ready = bridge_open && req_supported && !req_w_full &&
-                         (!chi_req_is_write || accept_wr_data) && !pm_l1_active;
-  assign chi_wr_data_ready = bridge_open && chi_req_valid && chi_req_is_write && !req_w_full &&
-                             !wdat_w_full && !pm_l1_active;
+  // §7.1: an unsupported opcode is accepted and answered with a CHI RSP carrying
+  // RespErr (NDERR) via a local clk-domain error-response FIFO, instead of the
+  // Phase-1 behaviour of stalling chi_req_ready forever (a request-channel
+  // deadlock). A compliant write master never sends WriteData for a rejected
+  // request (it would wait for a DBIDResp we never issue), so the data channel
+  // cannot deadlock either.
+  wire chi_req_is_err = !req_supported;   // opcode-based; accept gated on valid below
+  wire err_rsp_w_full;
 
-  wire req_w_en = chi_req_valid && chi_req_ready;
-  wire wdat_w_en = req_w_en && chi_req_is_write;
-  // The write's UCIe tag comes from the side-queue at data issue, so the data
-  // FIFO carries only the payload.
+  // §7.2: real CHI write handshake using a CHI-domain (clk) DBID pool. A write
+  // request is accepted on its own (no data), allocated a DBID, and answered with
+  // a DBIDResp. The master then sends WriteData tagged with that DBID; the bridge
+  // matches it, replays the stored request into the pipeline, and frees the DBID.
+  // This replaces the Phase-1 shortcut of requiring request+data in the same
+  // cycle and pushing write data straight through the FIFOs.
+  localparam integer WBUF    = FIFO_DEPTH;
+  localparam integer WBUF_AW = $clog2(WBUF);
+  reg  [WBUF-1:0]      dbid_valid;
+  reg  [CHI_REQ_W-1:0] wpend_req [0:WBUF-1];
+  wire                 dbid_pool_full = &dbid_valid;
+  wire                 dbid_rsp_w_full;
+
+  // Lowest free DBID (priority encoder over the free-list).
+  integer di;
+  reg [WBUF_AW-1:0] dbid_alloc;
+  always @(*) begin
+    dbid_alloc = {WBUF_AW{1'b0}};
+    for (di = WBUF-1; di >= 0; di = di - 1)
+      if (!dbid_valid[di]) dbid_alloc = di[WBUF_AW-1:0];
+  end
+
+  // Capacity-based readies. Intentionally independent of chi_req_valid /
+  // chi_wr_data_valid (AXI-style): a valid-dependent ready races with procedural
+  // "while(!ready) @(posedge clk); @(posedge clk);" drivers in the same delta and
+  // double-enqueues. The accept pulses below gate each ready on its valid.
+  wire cap_open = bridge_open && !pm_l1_active;
+  // WriteData carries its DBID in the DAT TxnID field; match it to a live entry.
+  wire [WBUF_AW-1:0] wr_dbid    = chi_wr_data[CHI_DAT_TXNID_LSB +: WBUF_AW];
+  wire               wr_dat_hit = dbid_valid[wr_dbid];
+
+  wire rd_req_ready  = chi_req_is_read  && cap_open && !req_w_full;
+  wire wr_req_ready  = chi_req_is_write && cap_open && !dbid_pool_full && !dbid_rsp_w_full;
+  wire err_req_ready = chi_req_is_err   && cap_open && !err_rsp_w_full;
+  wire wr_dat_ready  = wr_dat_hit       && cap_open && !req_w_full && !wdat_w_full;
+
+  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready;
+  assign chi_wr_data_ready = wr_dat_ready;
+
+  wire rd_req_accept  = chi_req_valid     && rd_req_ready;   // read: single-phase enqueue
+  wire wr_req_accept  = chi_req_valid     && wr_req_ready;   // write phase 1: alloc DBID
+  wire err_rsp_accept = chi_req_valid     && err_req_ready;  // §7.1 reject
+  wire wr_dat_accept  = chi_wr_data_valid && wr_dat_ready;   // write phase 2: enqueue
+
+  // req_fifo enqueue: reads push their request now; writes push the *stored*
+  // request when their WriteData arrives (so header and data enter together).
+  wire                 req_w_en   = rd_req_accept || wr_dat_accept;
+  wire [CHI_REQ_W-1:0] req_w_data = wr_dat_accept ? wpend_req[wr_dbid] : chi_req_data;
+  wire                 wdat_w_en  = wr_dat_accept;
+  wire                 err_rsp_w_en  = err_rsp_accept;
+  wire                 dbid_rsp_w_en = wr_req_accept;
+
+  always @(posedge clk or negedge clk_rst_n) begin
+    if (!clk_rst_n) begin
+      dbid_valid <= {WBUF{1'b0}};
+    end else begin
+      // Alloc and free target different slots (alloc picks a free one, free a
+      // valid one), so same-cycle alloc+free never conflict.
+      if (wr_req_accept) dbid_valid[dbid_alloc] <= 1'b1;
+      if (wr_dat_accept) dbid_valid[wr_dbid]    <= 1'b0;
+    end
+  end
+  always @(posedge clk) begin
+    if (wr_req_accept) wpend_req[dbid_alloc] <= chi_req_data;
+  end
 
   async_fifo #(.WIDTH(CHI_REQ_W), .DEPTH(FIFO_DEPTH)) u_req_fifo (
-    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(req_w_en), .w_data(chi_req_data), .w_full(req_w_full),
+    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(req_w_en), .w_data(req_w_data), .w_full(req_w_full),
     .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(hdr_fire),
     .r_data(req_r_data), .r_empty(req_r_empty)
   );
@@ -583,6 +647,41 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
+  // §7.1: build a CHI Comp response carrying RespErr=NDERR for a request the
+  // bridge cannot translate. Identity (TxnID/SrcID) is taken straight from the
+  // rejected request so it routes back to the originating requester.
+  function automatic [CHI_RSP_W-1:0] make_err_rsp;
+    input [CHI_REQ_W-1:0] chi_req;
+    reg [CHI_RSP_W-1:0] rsp;
+    begin
+      rsp = {CHI_RSP_W{1'b0}};
+      rsp[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] = CHI_RESPERR_NDERR;
+      rsp[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W]       = chi_req[CHI_REQ_TXNID_LSB +: CHI_RSP_DBID_W];
+      rsp[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]     = chi_req[CHI_REQ_TXNID_LSB +: TXNID_W];
+      rsp[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W]   = CHI_RSP_COMP;
+      rsp[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W]     = chi_req[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W];
+      make_err_rsp = rsp;
+    end
+  endfunction
+
+  // §7.2: build the DBIDResp for an accepted write request. Carries the allocated
+  // DBID (which the master must echo in its WriteData TxnID) plus the original
+  // CHI identity so it routes back to the requester.
+  function automatic [CHI_RSP_W-1:0] make_dbid_rsp;
+    input [CHI_REQ_W-1:0]  chi_req;
+    input [WBUF_AW-1:0]    dbid;
+    reg [CHI_RSP_W-1:0] rsp;
+    begin
+      rsp = {CHI_RSP_W{1'b0}};
+      rsp[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] = CHI_RESPERR_OK;
+      rsp[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W]       = {{(CHI_RSP_DBID_W-WBUF_AW){1'b0}}, dbid};
+      rsp[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]     = chi_req[CHI_REQ_TXNID_LSB +: TXNID_W];
+      rsp[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W]   = CHI_RSP_DBIDRESP;
+      rsp[CHI_RSP_SRCID_LSB +: CHI_RSP_SRCID_W]     = chi_req[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W];
+      make_dbid_rsp = rsp;
+    end
+  endfunction
+
   function automatic [CHI_DAT_W-1:0] translate_ucie_data_to_chi;
     input [UCIE_HDR_W-1:0] hdr;
     input [511:0]          data;
@@ -622,11 +721,68 @@ module chi_to_ucie_bridge #(
   wire rx_hdr_bad = rx_hdr_fire && !ucie_hdr_crc16_ok(ucie_rx_hdr);
   wire rx_dat_bad = rx_dat_fire && (rx_dat_beat_ctr == 3'd0) && !ucie_hdr_crc16_ok(ucie_rx_data);
 
+  // §7.1/§7.2: local clk-domain response FIFOs. Both the DBIDResp (write phase 1)
+  // and the NDERR error response live entirely in the CHI clock domain, so no CDC
+  // is needed for them.
+  wire [CHI_RSP_W-1:0] err_rsp_r_data;
+  wire                 err_rsp_r_empty;
+  wire [CHI_RSP_W-1:0] dbid_rsp_r_data;
+  wire                 dbid_rsp_r_empty;
+
+  // Arbitrate three RSP sources: DBIDResp first (starving the write master of its
+  // token would deadlock), then far-side completions, then error responses.
+  //
+  // A pure combinatorial mux violates the CHI valid/stable property: u_dbid_rsp_fifo
+  // uses both ports on clk but still has a 2-cycle gray-code sync latency, so
+  // dbid_rsp_r_empty can fall (new entry visible) while we are presenting a
+  // lower-priority rsp_r_data with chi_rsp_ready=0.  The registered state machine
+  // below latches the winner once per presentation and holds it until accepted.
+  wire any_rsp_avail = !dbid_rsp_r_empty || !rsp_r_empty || !err_rsp_r_empty;
+  reg  [CHI_RSP_W-1:0] rsp_held_data;
+  reg                   rsp_presenting;
+  reg                   rsp_src_dbid;   // 1 → pop u_dbid_rsp_fifo on accept
+  reg                   rsp_src_err;    // 1 → pop u_err_rsp_fifo; 0 → pop u_rsp_fifo
+  always @(posedge clk or negedge clk_rst_n) begin
+    if (!clk_rst_n) begin
+      rsp_presenting <= 1'b0;
+      rsp_src_dbid   <= 1'b0;
+      rsp_src_err    <= 1'b0;
+      rsp_held_data  <= {CHI_RSP_W{1'b0}};
+    end else if (rsp_presenting && chi_rsp_ready) begin
+      rsp_presenting <= 1'b0;
+    end else if (!rsp_presenting && any_rsp_avail) begin
+      rsp_presenting <= 1'b1;
+      rsp_src_dbid   <= !dbid_rsp_r_empty;
+      rsp_src_err    <= dbid_rsp_r_empty && rsp_r_empty;
+      rsp_held_data  <= !dbid_rsp_r_empty ? dbid_rsp_r_data :
+                        !rsp_r_empty      ? rsp_r_data : err_rsp_r_data;
+    end
+  end
+  assign chi_rsp_valid = rsp_presenting;
+  assign chi_rsp_data  = rsp_held_data;
+  wire dbid_rsp_pop = rsp_presenting && chi_rsp_ready &&  rsp_src_dbid;
+  wire rsp_pop      = rsp_presenting && chi_rsp_ready && !rsp_src_dbid && !rsp_src_err;
+  wire err_rsp_pop  = rsp_presenting && chi_rsp_ready && !rsp_src_dbid &&  rsp_src_err;
+
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
     .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
     .w_data(translate_ucie_hdr_to_chi_rsp(ucie_rx_hdr, a_txnid, a_srcid, a_valid)), .w_full(rsp_w_full),
-    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(chi_rsp_valid && chi_rsp_ready),
+    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(rsp_pop),
     .r_data(rsp_r_data), .r_empty(rsp_r_empty)
+  );
+
+  async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_dbid_rsp_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(dbid_rsp_w_en),
+    .w_data(make_dbid_rsp(chi_req_data, dbid_alloc)), .w_full(dbid_rsp_w_full),
+    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(dbid_rsp_pop),
+    .r_data(dbid_rsp_r_data), .r_empty(dbid_rsp_r_empty)
+  );
+
+  async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_err_rsp_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(err_rsp_w_en),
+    .w_data(make_err_rsp(chi_req_data)), .w_full(err_rsp_w_full),
+    .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(err_rsp_pop),
+    .r_data(err_rsp_r_data), .r_empty(err_rsp_r_empty)
   );
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_rdat_fifo (
@@ -636,8 +792,6 @@ module chi_to_ucie_bridge #(
     .r_data(rdat_r_data), .r_empty(rdat_r_empty)
   );
 
-  assign chi_rsp_valid = !rsp_r_empty;
-  assign chi_rsp_data = rsp_r_data;
   assign chi_comp_data_valid = !rdat_r_empty;
   assign chi_comp_data = rdat_r_data;
 
