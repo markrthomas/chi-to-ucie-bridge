@@ -1345,6 +1345,76 @@ module tb_chi_to_ucie_bridge;
       chi_comp_data_ready = 1'b0;
     end
 
+    $display("INFO: §12 DVM/barrier opcodes -> UCIE_PKT_KIND_DVM header + CHI Comp on AD_CPL return");
+    begin : dvm_ops
+      reg [7:0] dvm_tag;
+      integer dvm_i;
+      reg [6:0] dvm_opcodes [0:2];
+      reg [7:0] dvm_txnids  [0:2];
+      reg [47:0] dvm_addrs  [0:2];
+      begin
+        // DVMOp: addr carries DVM message payload (TLB type, VMID etc.).
+        // EOBarrier / ECBarrier: addr unused (zeroed).
+        dvm_opcodes[0] = CHI_REQ_DVMOP;     dvm_txnids[0] = 8'hD0; dvm_addrs[0] = 48'h0000_0001_0008;
+        dvm_opcodes[1] = CHI_REQ_EOBARRIER;  dvm_txnids[1] = 8'hD1; dvm_addrs[1] = 48'h0;
+        dvm_opcodes[2] = CHI_REQ_ECBARRIER;  dvm_txnids[2] = 8'hD2; dvm_addrs[2] = 48'h0;
+        chi_rsp_ready = 1'b1;
+        for (dvm_i = 0; dvm_i < 3; dvm_i = dvm_i + 1) begin
+          @(posedge clk);
+          chi_req_data = {CHI_REQ_W{1'b0}};
+          chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = dvm_opcodes[dvm_i];
+          chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = dvm_txnids[dvm_i];
+          chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h2A;
+          chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h0;
+          chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = dvm_addrs[dvm_i];
+          chi_req_valid = 1'b1;
+          while (!chi_req_ready) @(posedge clk);
+          @(posedge clk);
+          chi_req_valid = 1'b0;
+          // Bridge must issue kind=DVM header with code=opcode[3:0].
+          wait (ucie_tx_hdr_valid);
+          if (ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_DVM) begin
+            $display("FAIL: §12: DVM 0x%02x: UCIe kind 0x%x != DVM",
+                     dvm_opcodes[dvm_i],
+                     ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB]); $finish(1);
+          end
+          if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== dvm_opcodes[dvm_i][3:0]) begin
+            $display("FAIL: §12: DVM 0x%02x: UCIe code 0x%x != opcode[3:0]",
+                     dvm_opcodes[dvm_i],
+                     ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+          end
+          // DVMOp must carry the DVM addr payload verbatim.
+          if (dvm_opcodes[dvm_i] == CHI_REQ_DVMOP &&
+              ucie_tx_hdr[UCIE_ADDR_MSB:UCIE_ADDR_LSB] !== dvm_addrs[0]) begin
+            $display("FAIL: §12: DVMOp addr not forwarded (got %h)", ucie_tx_hdr[UCIE_ADDR_MSB:UCIE_ADDR_LSB]);
+            $finish(1);
+          end
+          dvm_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+          @(posedge ucie_clk);
+          // Far side returns AD_CPL; bridge must emit CHI Comp with RespErr=OK.
+          ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, dvm_tag,
+                                      48'h0, 8'h00, 8'h55, 8'h00, 8'h00);
+          ucie_rx_hdr_valid = 1'b1;
+          while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+          @(posedge ucie_clk);
+          ucie_rx_hdr_valid = 1'b0;
+          while (!(chi_rsp_valid &&
+                   chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_COMP))
+            @(posedge clk);
+          if (chi_rsp_data[CHI_RSP_RESPERR_LSB +: CHI_RSP_RESPERR_W] !== CHI_RESPERR_OK) begin
+            $display("FAIL: §12: DVM 0x%02x Comp RespErr not OK", dvm_opcodes[dvm_i]);
+            $finish(1);
+          end
+          if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== dvm_txnids[dvm_i]) begin
+            $display("FAIL: §12: DVM 0x%02x TxnID not echoed", dvm_opcodes[dvm_i]);
+            $finish(1);
+          end
+          @(posedge clk);
+        end
+        chi_rsp_ready = 1'b0;
+      end
+    end
+
     $display("PASS CHI-to-UCIe bridge directed smoke");
     $finish(0);
   end

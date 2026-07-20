@@ -291,7 +291,8 @@ module chi_to_ucie_bridge #(
   wire chi_req_is_read    = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_cmo     = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire chi_req_is_atomic  = is_chi_atomic(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);  // §11
-  wire req_supported      = chi_req_is_write || chi_req_is_read || chi_req_is_cmo || chi_req_is_atomic;
+  wire chi_req_is_dvm     = is_chi_dvm(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);    // §12
+  wire req_supported      = chi_req_is_write || chi_req_is_read || chi_req_is_cmo || chi_req_is_atomic || chi_req_is_dvm;
   wire chi_req_is_qos_hi  = chi_req_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8;  // §10
   wire throttle_lo        = outstanding_above_wm_clk && !chi_req_is_qos_hi;             // §10
 
@@ -340,9 +341,10 @@ module chi_to_ucie_bridge #(
   wire err_req_ready  = chi_req_is_err    && cap_open && !err_rsp_w_full;
   wire cmo_req_ready  = chi_req_is_cmo    && cap_open && !req_w_full   && !throttle_lo;  // §8
   wire atom_req_ready = chi_req_is_atomic && cap_open && !dbid_pool_full && !dbid_rsp_w_full && !throttle_lo;  // §11
+  wire dvm_req_ready  = chi_req_is_dvm    && cap_open && !req_w_full   && !throttle_lo;  // §12
   wire wr_dat_ready   = wr_dat_hit        && cap_open && !req_w_full && !wdat_w_full;
 
-  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready || atom_req_ready;
+  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready || atom_req_ready || dvm_req_ready;
   assign chi_wr_data_ready = wr_dat_ready;
 
   wire rd_req_accept   = chi_req_valid     && rd_req_ready;    // read: single-phase enqueue
@@ -350,11 +352,12 @@ module chi_to_ucie_bridge #(
   wire err_rsp_accept  = chi_req_valid     && err_req_ready;   // §7.1 reject
   wire cmo_req_accept  = chi_req_valid     && cmo_req_ready;   // §8 CMO: single-phase enqueue
   wire atom_req_accept = chi_req_valid     && atom_req_ready;  // §11 atomic phase 1: alloc DBID
+  wire dvm_req_accept  = chi_req_valid     && dvm_req_ready;   // §12 DVM/barrier: single-phase enqueue
   wire wr_dat_accept   = chi_wr_data_valid && wr_dat_ready;    // write/atomic phase 2: enqueue
 
-  // req_fifo enqueue: reads/CMOs push their request now; writes and atomics push
+  // req_fifo enqueue: reads/CMOs/DVMs push their request now; writes and atomics push
   // the *stored* request when their WriteData arrives (so header and data enter together).
-  wire                 req_w_en   = rd_req_accept || wr_dat_accept || cmo_req_accept;
+  wire                 req_w_en   = rd_req_accept || wr_dat_accept || cmo_req_accept || dvm_req_accept;
   wire [CHI_REQ_W-1:0] req_w_data = wr_dat_accept ? wpend_req[wr_dbid] : chi_req_data;
   wire                 wdat_w_en     = wr_dat_accept;
   wire                 err_rsp_w_en  = err_rsp_accept;
@@ -392,6 +395,7 @@ module chi_to_ucie_bridge #(
   wire                req_head_is_write  = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire                req_head_is_cmo    = is_chi_cmo(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
   wire                req_head_is_atomic = is_chi_atomic(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);  // §11
+  wire                req_head_is_dvm    = is_chi_dvm(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);    // §12
   wire [LTAG_W-1:0]   free_tag;
   wire                tbl_full;
   wire                tbl_tag_err;
@@ -491,7 +495,7 @@ module chi_to_ucie_bridge #(
     .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
     .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
     .alloc_is_write(req_head_is_write),
-    .alloc_is_large(!req_head_is_write && !req_head_is_cmo &&
+    .alloc_is_large(!req_head_is_write && !req_head_is_cmo && !req_head_is_dvm &&
                     (req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W] >= 3'd6)),
     .free_tag(free_tag),
     .full(tbl_full),
@@ -646,6 +650,11 @@ module chi_to_ucie_bridge #(
       // attr[7] = has_ret (1 for Load/Swap/Compare, 0 for Store).
       end else if (is_chi_atomic(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W])) begin
         kind = UCIE_PKT_KIND_ATOM;
+        code = chi_req[CHI_REQ_OPCODE_LSB +: 4];
+      // §12: DVMOp/barriers → UCIE_PKT_KIND_DVM; code = lower 4 bits of CHI opcode.
+      // addr carries the DVM message payload (TLB type, VMID, etc.) verbatim.
+      end else if (is_chi_dvm(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W])) begin
+        kind = UCIE_PKT_KIND_DVM;
         code = chi_req[CHI_REQ_OPCODE_LSB +: 4];
       end else begin
         kind = UCIE_PKT_KIND_AD_REQ;

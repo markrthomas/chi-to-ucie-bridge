@@ -71,6 +71,7 @@ UCIE_PKT_KIND_MEM_CPL = 0xA
 UCIE_PKT_KIND_SNP_RSP = 0xB  # §9: snoop response (header ± dirty data)
 UCIE_PKT_KIND_CMO     = 0xC
 UCIE_PKT_KIND_SNP     = 0xD  # §9: incoming snoop request
+UCIE_PKT_KIND_DVM     = 0x7  # §12: DVM/barrier request
 UCIE_PKT_KIND_ATOM    = 0xF  # §11: atomic request header + 1-beat operand data
 
 # §11: CHI atomic opcodes
@@ -78,6 +79,11 @@ CHI_REQ_ATOMICSTORE_ADD  = 0x20  # atomic add, no return data
 CHI_REQ_ATOMICLOAD_ADD   = 0x28  # atomic add, returns old value
 CHI_REQ_ATOMICSWAP       = 0x30  # atomic exchange, returns old value
 CHI_REQ_ATOMICCOMPARE    = 0x31  # compare-and-swap, returns old value
+
+# §12: CHI DVM/barrier opcodes
+CHI_REQ_DVMOP     = 0x10  # TLB/DVM invalidation
+CHI_REQ_EOBARRIER = 0x14  # end-of-order barrier
+CHI_REQ_ECBARRIER = 0x15  # end-of-coherency barrier
 UCIE_MSG_MEM_RD       = 0x3
 UCIE_MSG_MEM_WR       = 0x4
 UCIE_MSG_MEM_WR_DATA  = 0x6
@@ -143,6 +149,17 @@ def make_chi_write_data(txnid, data):
 
 def make_chi_cmo(opcode, txnid, addr, srcid=0x12, size=6):
     """Build a CHI CMO request flit (no write data follows)."""
+    flit = 0
+    flit |= (opcode & 0x7F) << CHI_REQ_OPCODE_LSB
+    flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
+    flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
+    flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
+    flit |= (size  & 0x7)  << CHI_REQ_SIZE_LSB
+    return flit
+
+
+def make_chi_dvm(opcode, txnid, addr=0, srcid=0x2A, size=0):
+    """§12: Build a CHI DVM/barrier REQ flit (header-only; addr carries DVM payload for DVMOp)."""
     flit = 0
     flit |= (opcode & 0x7F) << CHI_REQ_OPCODE_LSB
     flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
@@ -2245,3 +2262,88 @@ async def test_atomic_load(dut):
             break
     assert comp_seen, "CHI CompData never seen for AtomicLoadAdd"
     dut._log.info("atomic_load: AtomicLoadAdd → ATOM header + operand → MEM_CPL → CompData OK")
+
+
+@cocotb.test()
+async def test_dvm_ops(dut):
+    """§12: DVMOp + EOBarrier + ECBarrier translate to UCIE_PKT_KIND_DVM and get CHI Comp.
+
+    Each DVM/barrier request is header-only (no write data).  The bridge must accept it
+    (chi_req_ready=1), emit a UCIe header with kind=DVM and code=opcode[3:0], forward
+    the CHI addr field verbatim in the UCIe addr field (for DVMOp), and produce a CHI
+    Comp RSP (RespErr=OK, matching TxnID) when the far side returns an AD_CPL.
+    """
+    await reset_and_open(dut)
+
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1
+    dut.chi_comp_data_ready.value = 1
+
+    # DVMOp: addr carries the DVM message payload (TLB type, VMID etc.).
+    # EOBarrier / ECBarrier: addr unused.
+    dvm_cases = [
+        (CHI_REQ_DVMOP,     0xD0, 0x0000_0001_0008),
+        (CHI_REQ_EOBARRIER, 0xD1, 0),
+        (CHI_REQ_ECBARRIER, 0xD2, 0),
+    ]
+
+    for opcode, txnid, addr in dvm_cases:
+        await RisingEdge(dut.clk)
+        dut.chi_req_data.value  = make_chi_dvm(opcode, txnid, addr)
+        dut.chi_req_valid.value = 1
+        accepted = False
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                accepted = True
+                break
+        assert accepted, f"DVM 0x{opcode:02x}: chi_req_ready never asserted"
+
+        # Wait for UCIe TX header with kind=DVM
+        tx_tag = None
+        for _ in range(80):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1:
+                hdr = int(dut.ucie_tx_hdr.value)
+                got_kind = field(hdr, UCIE_KIND_LSB, 4)
+                got_code = field(hdr, UCIE_CODE_LSB, 4)
+                assert got_kind == UCIE_PKT_KIND_DVM, \
+                    f"DVM 0x{opcode:02x}: UCIe kind=0x{got_kind:x} want 0x{UCIE_PKT_KIND_DVM:x}"
+                assert got_code == (opcode & 0xF), \
+                    f"DVM 0x{opcode:02x}: UCIe code=0x{got_code:x} want 0x{opcode & 0xF:x}"
+                if opcode == CHI_REQ_DVMOP:
+                    got_addr = field(hdr, UCIE_ADDR_LSB, 48)
+                    assert got_addr == addr, \
+                        f"DVMOp: UCIe addr=0x{got_addr:x} want 0x{addr:x}"
+                tx_tag = field(hdr, UCIE_TAG_LSB, 8)
+                dut.ucie_rx_hdr_crdt.value = 1
+                break
+        assert tx_tag is not None, f"DVM 0x{opcode:02x}: no UCIe TX header"
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_rx_hdr_crdt.value = 0
+
+        # Far side returns AD_CPL; bridge must produce CHI Comp RSP.
+        ad_cpl = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, tx_tag)
+        await _send_rx_hdr(dut, ad_cpl)
+
+        got_rsp = False
+        for _ in range(100):
+            await RisingEdge(dut.clk)
+            if dut.chi_rsp_valid.value == 1:
+                rsp = int(dut.chi_rsp_data.value)
+                got_opcode  = field(rsp, CHI_RSP_OPCODE_LSB, 4)
+                got_resperr = field(rsp, CHI_RSP_RESPERR_LSB, 2)
+                got_txnid   = field(rsp, CHI_RSP_TXNID_LSB, 8)
+                assert got_opcode == CHI_RSP_COMP, \
+                    f"DVM 0x{opcode:02x}: RSP opcode=0x{got_opcode:x} want Comp"
+                assert got_resperr == 0, \
+                    f"DVM 0x{opcode:02x}: RespErr=0x{got_resperr:x} want OK"
+                assert got_txnid == txnid, \
+                    f"DVM 0x{opcode:02x}: TxnID=0x{got_txnid:x} want 0x{txnid:x}"
+                got_rsp = True
+                break
+        assert got_rsp, f"DVM 0x{opcode:02x}: no CHI Comp RSP"
+
+    dut._log.info("dvm_ops: DVMOp / EOBarrier / ECBarrier all OK")

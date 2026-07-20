@@ -51,6 +51,10 @@ localparam [6:0] CHI_REQ_ATOMICSTORE_ADD    = 7'h20;  // atomic add, no return d
 localparam [6:0] CHI_REQ_ATOMICLOAD_ADD     = 7'h28;  // atomic add, returns old value
 localparam [6:0] CHI_REQ_ATOMICSWAP         = 7'h30;  // atomic exchange, returns old value
 localparam [6:0] CHI_REQ_ATOMICCOMPARE      = 7'h31;  // compare-and-swap, returns old value
+// §12: DVM and barrier opcodes — header-only, return Comp via AD_CPL
+localparam [6:0] CHI_REQ_DVMOP             = 7'h10;  // TLB/DVM invalidation
+localparam [6:0] CHI_REQ_EOBARRIER         = 7'h14;  // end-of-order barrier
+localparam [6:0] CHI_REQ_ECBARRIER         = 7'h15;  // end-of-coherency barrier
 
 localparam [3:0] CHI_RSP_COMP            = 4'h4;
 localparam [3:0] CHI_RSP_DBIDRESP        = 4'h3;
@@ -119,6 +123,7 @@ localparam integer CHI_DAT_OPCODE_LSB  = CHI_DAT_TXNID_LSB   + CHI_DAT_TXNID_W;
 localparam integer CHI_DAT_W           = CHI_DAT_OPCODE_LSB  + CHI_DAT_OPCODE_W;
 
 // ---- UCIe adapter packet kinds and codes ----
+localparam [3:0] UCIE_PKT_KIND_DVM     = 4'h7;  // §12: bridge → far: DVM/barrier request
 localparam [3:0] UCIE_PKT_KIND_AD_REQ  = 4'h8;
 localparam [3:0] UCIE_PKT_KIND_AD_CPL  = 4'h9;
 localparam [3:0] UCIE_PKT_KIND_MEM_CPL = 4'ha;
@@ -225,6 +230,19 @@ function automatic is_chi_atomic_store;
     case (opcode)
       CHI_REQ_ATOMICSTORE_ADD: is_chi_atomic_store = 1'b1;
       default:                 is_chi_atomic_store = 1'b0;
+    endcase
+  end
+endfunction
+
+// §12: DVMOp + ordering barriers — header-only; far side answers with AD_CPL → Comp.
+function automatic is_chi_dvm;
+  input [6:0] opcode;
+  begin
+    case (opcode)
+      CHI_REQ_DVMOP,
+      CHI_REQ_EOBARRIER,
+      CHI_REQ_ECBARRIER: is_chi_dvm = 1'b1;
+      default:           is_chi_dvm = 1'b0;
     endcase
   end
 endfunction
