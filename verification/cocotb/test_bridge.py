@@ -32,6 +32,7 @@ CHI_DAT_BE_LSB = 512
 CHI_DAT_POISON_LSB = 576
 CHI_DAT_DATAID_LSB = 577   # 4-bit field after POISON
 CHI_DAT_RESPERR_LSB = 581
+CHI_DAT_RESP_LSB    = 583   # CHI_DAT_RESPERR_LSB + 2 (resp field, 3 bits)
 CHI_DAT_TXNID_LSB = 586
 CHI_DAT_OPCODE_LSB = 594
 CHI_DAT_COMPDATA = 0x4
@@ -67,11 +68,27 @@ UCIE_HDR_MASK = (1 << 128) - 1
 UCIE_PKT_KIND_AD_REQ  = 0x8
 UCIE_PKT_KIND_AD_CPL  = 0x9
 UCIE_PKT_KIND_MEM_CPL = 0xA
+UCIE_PKT_KIND_SNP_RSP = 0xB  # §9: snoop response (header ± dirty data)
 UCIE_PKT_KIND_CMO     = 0xC
+UCIE_PKT_KIND_SNP     = 0xD  # §9: incoming snoop request
 UCIE_MSG_MEM_RD       = 0x3
 UCIE_MSG_MEM_WR       = 0x4
 UCIE_MSG_MEM_WR_DATA  = 0x6
 UCIE_CPL_SC           = 0x1
+
+# §9: CHI SNP / SnpResp field positions (mirrors chi_ucie_bridge_defs.vh)
+CHI_SNP_RETTOS_LSB = 0
+CHI_SNP_DONOT_LSB  = 1
+CHI_SNP_SRCID_LSB  = 2
+CHI_SNP_TXNID_LSB  = 9
+CHI_SNP_ADDR_LSB   = 17
+CHI_SNP_OPCODE_LSB = 65
+
+CHI_SNPRSP_RESP_LSB   = 0
+CHI_SNPRSP_TXNID_LSB  = 3
+CHI_SNPRSP_OPCODE_LSB = 11
+CHI_SNPRSP_SRCID_LSB  = 15
+CHI_SNPRSP_OP         = 0x1
 
 # §8: CHI Cache-Maintenance Operation opcodes
 CHI_REQ_CLEANSHARED        = 0x08
@@ -125,6 +142,26 @@ def make_chi_cmo(opcode, txnid, addr, srcid=0x12, size=6):
     flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
     flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
     flit |= (size  & 0x7)  << CHI_REQ_SIZE_LSB
+    return flit
+
+
+def make_chi_snp_rsp(txnid, resp=0, srcid=0x10):
+    """Build a CHI SnpResp flit (header-only, no dirty data)."""
+    flit = 0
+    flit |= (resp   & 0x7) << CHI_SNPRSP_RESP_LSB
+    flit |= (txnid  & 0xFF) << CHI_SNPRSP_TXNID_LSB
+    flit |= (CHI_SNPRSP_OP & 0xF) << CHI_SNPRSP_OPCODE_LSB
+    flit |= (srcid  & 0x7F) << CHI_SNPRSP_SRCID_LSB
+    return flit
+
+
+def make_chi_snp_rsp_dat(txnid, data, resp=3, srcid=0x10):
+    """Build a CHI SnpRespData flit (includes 512b dirty line; CHI_DAT_W format)."""
+    flit = 0
+    flit |= (data  & MASK512) << CHI_DAT_DATA_LSB
+    flit |= (resp  & 0x7)  << CHI_DAT_RESP_LSB
+    flit |= (txnid & 0xFF) << CHI_DAT_TXNID_LSB
+    flit |= (0x1   & 0xF)  << CHI_DAT_OPCODE_LSB   # SnpRespData opcode=1
     return flit
 
 
@@ -201,6 +238,11 @@ async def reset_and_open(dut):
     dut.ucie_rx_data.value = 0
     dut.ucie_rx_hdr_crdt.value = 0
     dut.ucie_rx_dat_crdt.value = 0
+    dut.chi_snp_ready.value         = 1
+    dut.chi_snp_rsp_valid.value     = 0
+    dut.chi_snp_rsp_data.value      = 0
+    dut.chi_snp_rsp_dat_valid.value = 0
+    dut.chi_snp_rsp_dat_data.value  = 0
 
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     cocotb.start_soon(Clock(dut.ucie_clk, 6, units="ns").start())
@@ -1772,4 +1814,185 @@ async def test_qos_throttle(dut):
     dut._log.info(
         f"QoS throttle OK: stall verified at WM={WM}, "
         f"qos_lo_stall_cnt={stall_cnt}; lo-QoS resumed after drain"
+    )
+
+@cocotb.test(timeout_time=1, timeout_unit="ms")
+async def test_snoop_basic(dut):
+    """§9: UCIe SNP → chi_snp_valid; CHI SnpResp → UCIe SNP_RSP header.
+
+    Injects one UCIe SNP packet, verifies chi_snp_valid with correct TxnID/addr,
+    then drives a header-only CHI SnpResp and verifies the UCIe SNP_RSP header.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1
+    dut.chi_comp_data_ready.value = 1
+
+    SNP_TXNID = 0x42
+    SNP_ADDR  = 0xABCD_0000_1000
+    SNP_SRCID = 0x2A
+
+    # 1. Inject UCIe SNP header.
+    snp_hdr = pack_ucie_hdr(
+        UCIE_PKT_KIND_SNP, 0x7,  # code = SnpUnique opcode[3:0]
+        SNP_TXNID, SNP_ADDR, 0x40, SNP_SRCID, 0x00, 0x00
+    )
+    await _send_rx_hdr(dut, snp_hdr)
+
+    # 2. Verify chi_snp_valid with correct fields.
+    chi_snp_seen = False
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_snp_valid.value == 1:
+            snp = int(dut.chi_snp_data.value)
+            got_txnid = field(snp, CHI_SNP_TXNID_LSB, 8)
+            got_addr  = field(snp, CHI_SNP_ADDR_LSB,  48)
+            got_srcid = field(snp, CHI_SNP_SRCID_LSB, 7)
+            assert got_txnid == SNP_TXNID, \
+                f"chi_snp TxnID=0x{got_txnid:02X} want 0x{SNP_TXNID:02X}"
+            assert got_addr  == SNP_ADDR,  \
+                f"chi_snp addr=0x{got_addr:012X} want 0x{SNP_ADDR:012X}"
+            assert got_srcid == SNP_SRCID, \
+                f"chi_snp SrcID=0x{got_srcid:02X} want 0x{SNP_SRCID:02X}"
+            chi_snp_seen = True
+            break
+    assert chi_snp_seen, "chi_snp_valid never asserted"
+
+    # 3. CHI master drives SnpResp (no dirty data, resp=I=0).
+    await RisingEdge(dut.clk)
+    dut.chi_snp_rsp_data.value  = make_chi_snp_rsp(SNP_TXNID, resp=0, srcid=0x10)
+    dut.chi_snp_rsp_valid.value = 1
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        if dut.chi_snp_rsp_ready.value == 1:
+            dut.chi_snp_rsp_valid.value = 0
+            break
+    else:
+        assert False, "chi_snp_rsp_ready never asserted"
+    await RisingEdge(dut.clk)
+    dut.chi_snp_rsp_valid.value = 0
+
+    # 4. Bridge emits UCIe SNP_RSP header (kind=B, has_dat=0, resp=I).
+    snp_rsp_hdr_seen = False
+    for _ in range(100):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            hdr = int(dut.ucie_tx_hdr.value)
+            got_kind = field(hdr, UCIE_KIND_LSB, 4)
+            got_code = field(hdr, UCIE_CODE_LSB, 4)
+            got_tag  = field(hdr, UCIE_TAG_LSB, 8)
+            assert got_kind == UCIE_PKT_KIND_SNP_RSP, \
+                f"UCIe SNP_RSP kind=0x{got_kind:X} want 0x{UCIE_PKT_KIND_SNP_RSP:X}"
+            assert got_code == 0x0, \
+                f"SNP_RSP code=0x{got_code:X} want 0x0 (has_dat=0,resp=I)"
+            assert got_tag == SNP_TXNID, \
+                f"SNP_RSP tag=0x{got_tag:02X} want 0x{SNP_TXNID:02X}"
+            snp_rsp_hdr_seen = True
+            break
+    assert snp_rsp_hdr_seen, "UCIe SNP_RSP header never seen"
+
+    # 5. Data channel must stay quiet (no dirty data follows).
+    await ClockCycles(dut.ucie_clk, 4)
+    assert dut.ucie_tx_data_valid.value == 0, \
+        "unexpected data beat after header-only SnpResp"
+
+    dut._log.info("snoop_basic: SNP injected → chi_snp_valid OK; SnpResp → SNP_RSP header OK")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_snoop_dirty(dut):
+    """§9: CHI SnpRespData (dirty writeback) → UCIe SNP_RSP header + 5-flit data burst.
+
+    Verifies that a dirty cache-line writeback is transmitted correctly:
+    header on the UCIe TX header channel, then 5 flits (beat 0 = data-burst
+    header, beats 1-4 = 128-bit slices of the 512-bit dirty line) on the data channel.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1
+    dut.chi_comp_data_ready.value = 1
+
+    SNP_TXNID  = 0x7F
+    SNP_ADDR   = 0xABCD_0000_2000
+    DIRTY_DATA = 0xDEADC0DE_CAFEBABE_12345678_9ABCDEF0_FEDCBA98_76543210_11223344_55667788
+
+    # Inject UCIe SNP.
+    snp_hdr = pack_ucie_hdr(
+        UCIE_PKT_KIND_SNP, 0x1,  # SnpClean opcode[3:0]=1
+        SNP_TXNID, SNP_ADDR, 0x40, 0x2A, 0x00, 0x00
+    )
+    await _send_rx_hdr(dut, snp_hdr)
+
+    # Wait for chi_snp_valid.
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        if dut.chi_snp_valid.value == 1:
+            break
+    assert dut.chi_snp_valid.value == 1, "chi_snp_valid never asserted"
+
+    # CHI master drives SnpRespData (resp=UD=3, dirty 512-bit line).
+    await RisingEdge(dut.clk)
+    dut.chi_snp_rsp_dat_data.value  = make_chi_snp_rsp_dat(SNP_TXNID, DIRTY_DATA, resp=3)
+    dut.chi_snp_rsp_dat_valid.value = 1
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        if dut.chi_snp_rsp_dat_ready.value == 1:
+            dut.chi_snp_rsp_dat_valid.value = 0
+            break
+    else:
+        assert False, "chi_snp_rsp_dat_ready never asserted"
+    await RisingEdge(dut.clk)
+    dut.chi_snp_rsp_dat_valid.value = 0
+
+    # Bridge must emit SNP_RSP header with has_dat=1, resp=UD(3'b011)=3 → code=0xB.
+    hdr_seen = False
+    for _ in range(100):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            hdr = int(dut.ucie_tx_hdr.value)
+            got_kind = field(hdr, UCIE_KIND_LSB, 4)
+            got_code = field(hdr, UCIE_CODE_LSB, 4)
+            got_tag  = field(hdr, UCIE_TAG_LSB, 8)
+            assert got_kind == UCIE_PKT_KIND_SNP_RSP, \
+                f"SNP_RSP header kind=0x{got_kind:X}"
+            assert got_code == 0xB, \
+                f"SNP_RSP code=0x{got_code:X} want 0xB (has_dat=1, resp=UD=3)"
+            assert got_tag == SNP_TXNID, \
+                f"SNP_RSP tag=0x{got_tag:02X} want 0x{SNP_TXNID:02X}"
+            hdr_seen = True
+            break
+    assert hdr_seen, "UCIe SNP_RSP header never seen"
+
+    # Data channel: beat 0 = data-burst header, beats 1-4 = dirty line slices.
+    # Stall ready=0 so the beat counter doesn't advance while we read; pulse ready=1
+    # for one ucie_clk to fire each beat and advance to the next.
+    dut.ucie_tx_data_ready.value = 0
+
+    for beat in range(5):
+        # Wait for valid with ready=0 — beat counter frozen at 'beat'.
+        for _ in range(100):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_data_valid.value == 1:
+                break
+        assert dut.ucie_tx_data_valid.value == 1, \
+            f"snoop data beat {beat} never appeared (ucie_tx_data_valid=0)"
+
+        dat = int(dut.ucie_tx_data.value)
+        if beat == 0:
+            assert field(dat, UCIE_KIND_LSB, 4) == UCIE_PKT_KIND_SNP_RSP, \
+                f"beat 0 (data-burst header) kind=0x{field(dat, UCIE_KIND_LSB, 4):X}"
+        else:
+            exp = (DIRTY_DATA >> (128 * (beat - 1))) & ((1 << 128) - 1)
+            assert dat == exp, \
+                f"dirty data beat {beat}: got 0x{dat:032X} want 0x{exp:032X}"
+
+        # Fire this beat: pulse ready=1 for one cycle, then re-stall.
+        dut.ucie_tx_data_ready.value = 1
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_tx_data_ready.value = 0
+
+    dut._log.info(
+        "snoop_dirty: SnpRespData → SNP_RSP header + 5-beat dirty burst verified"
     )

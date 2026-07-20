@@ -90,7 +90,22 @@ module chi_to_ucie_bridge #(
   // QoS observability (§5.4): counts UCIe headers issued with CHI QoS >= 8.
   output reg  [15:0]              qos_hi_cnt,
   // §10: counts cycles a low-QoS request is held off by the watermark.
-  output reg  [15:0]              qos_lo_stall_cnt
+  output reg  [15:0]              qos_lo_stall_cnt,
+
+  // §9: CHI Snoop channel (bridge → CHI master)
+  output wire                     chi_snp_valid,
+  output wire [CHI_SNP_W-1:0]    chi_snp_data,
+  input  wire                     chi_snp_ready,
+
+  // §9: CHI SnpResp channel (CHI master → bridge, header-only)
+  input  wire                     chi_snp_rsp_valid,
+  input  wire [CHI_SNPRSP_W-1:0] chi_snp_rsp_data,
+  output wire                     chi_snp_rsp_ready,
+
+  // §9: CHI SnpRespData channel (CHI master → bridge, with dirty line)
+  input  wire                     chi_snp_rsp_dat_valid,
+  input  wire [CHI_DAT_W-1:0]    chi_snp_rsp_dat_data,
+  output wire                     chi_snp_rsp_dat_ready
 );
 
   localparam integer LTAG_W = $clog2(MAX_OUTSTANDING);
@@ -129,6 +144,23 @@ module chi_to_ucie_bridge #(
   wire [CHI_RSP_W-1:0] rsp_r_data;
   wire [CHI_DAT_W-1:0] rdat_r_data;
 
+  // §9: Snoop FIFO wires (declared early for Icarus compatibility)
+  wire snp_rx_w_full;
+  wire snp_rx_r_empty;
+  wire [CHI_SNP_W-1:0]      snp_rx_r_data;
+
+  wire snp_rsp_w_full;
+  wire snp_rsp_r_empty;
+  wire [CHI_SNPRSP_W:0]     snp_rsp_r_data;  // [CHI_SNPRSP_W] = has_dat flag
+
+  wire snp_dat_w_full;
+  wire snp_dat_r_empty;
+  wire [CHI_DAT_W-1:0]      snp_dat_r_data;
+
+  // §9: CDCs for snp_rsp and snp_dat read-side empties (ucie_clk → clk) for all_empty
+  wire snp_rsp_r_empty_clk;
+  wire snp_dat_r_empty_clk;
+
   // Internal control pulses (declared early for Icarus compatibility)
   wire hdr_fire;
   wire data_fire;
@@ -138,6 +170,30 @@ module chi_to_ucie_bridge #(
   // §10: QoS watermark CDC (declared early; driven after txn_table below)
   wire outstanding_above_wm;      // ucie_clk domain
   wire outstanding_above_wm_clk;  // clk domain (2-flop CDC)
+
+  // §9: TX presenting state machine (replaces held_v/held_tag/held_seq)
+  reg        tx_presenting;
+  reg        tx_is_snp_rsp;
+  reg  [LTAG_W-1:0] tx_held_tag;
+  reg  [7:0]        tx_held_seq;
+  wire req_hdr_fire     = hdr_fire && !tx_is_snp_rsp;
+  wire snp_rsp_hdr_fire = hdr_fire &&  tx_is_snp_rsp;
+
+  // §9: Snoop data tag queue (sdq) — tracks pending snp_rsp with dirty data
+  reg [TXNID_W-1:0] sdq_mem [0:MAX_OUTSTANDING-1];
+  reg [WQ_AW:0]     sdq_wptr;
+  reg [WQ_AW:0]     sdq_rptr;
+  wire sdq_empty = (sdq_wptr == sdq_rptr);
+  wire [TXNID_W-1:0] sdq_front_txnid = sdq_mem[sdq_rptr[WQ_AW-1:0]];
+
+  // §9: TX data mux — snoop dirty data takes priority over write data.
+  // snp_dat_last/snp_dat_fire/sdq_pop are assigned after tx_dat_beat_ctr and data_fire
+  // are in scope (Icarus no-forward-reference rule).
+  wire tx_dat_is_snp;
+  wire snp_dat_last;
+  wire snp_dat_fire;
+  wire sdq_pop;
+  assign tx_dat_is_snp = !sdq_empty;
 
   // Multi-beat burst counters (§4.3 / §6.1)
   reg [2:0] tx_dat_beat_ctr;
@@ -187,7 +243,8 @@ module chi_to_ucie_bridge #(
     .clk(clk), .rst_n(clk_rst_n), .d(wdat_r_empty), .q(wdat_r_empty_clk)
   );
 
-  wire all_empty = req_r_empty_clk && wdat_r_empty_clk && rsp_r_empty && rdat_r_empty;
+  wire all_empty = req_r_empty_clk && wdat_r_empty_clk && rsp_r_empty && rdat_r_empty
+               && snp_rx_r_empty && snp_rsp_r_empty_clk && snp_dat_r_empty_clk;
 
   // PHY link controller: translates phy_init_done / link_error into the
   // reset_drain link_up signal, and sequences the error-recovery retrain flow.
@@ -316,13 +373,13 @@ module chi_to_ucie_bridge #(
 
   async_fifo #(.WIDTH(CHI_REQ_W), .DEPTH(FIFO_DEPTH)) u_req_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(req_w_en), .w_data(req_w_data), .w_full(req_w_full),
-    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(hdr_fire),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(req_hdr_fire),
     .r_data(req_r_data), .r_empty(req_r_empty)
   );
 
   async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_wdat_fifo (
     .w_clk(clk), .w_rst_n(clk_rst_n), .w_en(wdat_w_en), .w_data(chi_wr_data), .w_full(wdat_w_full),
-    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire && tx_dat_last),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n), .r_en(data_fire && tx_dat_last && !tx_dat_is_snp),
     .r_data(wdat_r_data), .r_empty(wdat_r_empty)
   );
 
@@ -388,31 +445,25 @@ module chi_to_ucie_bridge #(
                                  ucie_rx_data[UCIE_TAG_LSB +: LTAG_W] :
                                  rx_dat_tag_latched;
 
-  // Hold the local tag stable for the whole header handshake. Without this the
-  // presented tag could change mid-stall if a completion frees a lower slot,
-  // violating valid/ready payload stability. Latch free_tag when a header is
-  // first offered; reuse it until the header is accepted.
-  reg  [LTAG_W-1:0]   held_tag;
-  reg  [7:0]          held_seq;
-  reg                 held_v;
-  wire [LTAG_W-1:0]   present_tag = held_v ? held_tag : free_tag;
-  wire [7:0]          present_seq = held_v ? held_seq : flit_seq_ctr;
+  // §9: TX presenting state machine — locks in the source and tag/seq for the
+  // duration of each header handshake, supporting both req (CHI→UCIe) and
+  // snp_rsp (SnpResp/SnpRespData) sources on the same UCIe TX header channel.
+  wire any_tx_src = bridge_open_ucie &&
+      (!snp_rsp_r_empty || (!req_r_empty && !tbl_full));
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n) begin
-      held_v   <= 1'b0;
-      held_tag <= {LTAG_W{1'b0}};
-      held_seq <= 8'h00;
-    end else if (hdr_fire) begin
-      held_v   <= 1'b0;
-    end else if (ucie_tx_hdr_valid && !ucie_tx_hdr_ready) begin
-      if (!held_v) begin
-        held_tag <= present_tag;
-        held_seq <= present_seq;
-        held_v   <= 1'b1;
-      end
-    end else if (!ucie_tx_hdr_valid) begin
-      held_v   <= 1'b0;
+      tx_presenting <= 1'b0;
+      tx_is_snp_rsp <= 1'b0;
+      tx_held_tag   <= {LTAG_W{1'b0}};
+      tx_held_seq   <= 8'h00;
+    end else if (tx_presenting && (hdr_fire || !bridge_open_ucie)) begin
+      tx_presenting <= 1'b0;
+    end else if (!tx_presenting && any_tx_src) begin
+      tx_presenting  <= 1'b1;
+      tx_is_snp_rsp  <= !snp_rsp_r_empty;
+      tx_held_tag    <= free_tag;
+      tx_held_seq    <= flit_seq_ctr;
     end
   end
 
@@ -431,8 +482,8 @@ module chi_to_ucie_bridge #(
     .N(MAX_OUTSTANDING), .TID_W(TXNID_W), .SID_W(NODEID_W), .LTAG_W(LTAG_W)
   ) u_txn_table (
     .clk(ucie_clk), .rst_n(ucie_rst_n),
-    .alloc_en(hdr_fire),
-    .alloc_idx(present_tag),
+    .alloc_en(req_hdr_fire),
+    .alloc_idx(tx_held_tag),
     .alloc_txnid(req_r_data[CHI_REQ_TXNID_LSB +: TXNID_W]),
     .alloc_srcid(req_r_data[CHI_REQ_SRCID_LSB +: CHI_REQ_SRCID_W]),
     .alloc_is_write(req_head_is_write),
@@ -452,6 +503,14 @@ module chi_to_ucie_bridge #(
   assign outstanding_above_wm = (outstanding >= QOS_THROTTLE_WM[LTAG_W:0]);
   cdc_sync #(.STAGES(2)) u_qos_wm_cdc (
     .clk(clk), .rst_n(clk_rst_n), .d(outstanding_above_wm), .q(outstanding_above_wm_clk)
+  );
+
+  // §9: CDC of snp_rsp / snp_dat read-side empties (ucie_clk → clk) for all_empty.
+  cdc_sync #(.STAGES(2)) u_snp_rsp_empty_cdc (
+    .clk(clk), .rst_n(clk_rst_n), .d(snp_rsp_r_empty), .q(snp_rsp_r_empty_clk)
+  );
+  cdc_sync #(.STAGES(2)) u_snp_dat_empty_cdc (
+    .clk(clk), .rst_n(clk_rst_n), .d(snp_dat_r_empty), .q(snp_dat_r_empty_clk)
   );
 
   // ---------------------------------------------------------------------------
@@ -477,10 +536,11 @@ module chi_to_ucie_bridge #(
     end
   endfunction
   assign wq_front_last_beat = size_to_last_beat(wq_front_size);
-  assign tx_dat_last        = (tx_dat_beat_ctr == wq_front_last_beat);
+  assign tx_dat_last        = tx_dat_is_snp ? snp_dat_last
+                                            : (tx_dat_beat_ctr == wq_front_last_beat);
 
-  wire wq_push = hdr_fire && req_head_is_write;
-  wire wq_pop  = data_fire && tx_dat_last;
+  wire wq_push = req_hdr_fire && req_head_is_write;
+  wire wq_pop  = data_fire && tx_dat_last && !tx_dat_is_snp;
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
     if (!ucie_rst_n) begin
@@ -488,7 +548,7 @@ module chi_to_ucie_bridge #(
       wq_rptr <= {(WQ_AW+1){1'b0}};
     end else begin
       if (wq_push) begin
-        wtag_mem[wq_wptr[WQ_AW-1:0]] <= {req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W], present_tag};
+        wtag_mem[wq_wptr[WQ_AW-1:0]] <= {req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W], tx_held_tag};
         wq_wptr <= wq_wptr + 1'b1;
       end
       if (wq_pop) wq_rptr <= wq_rptr + 1'b1;
@@ -629,9 +689,11 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
-  assign ucie_tx_hdr_valid = bridge_open_ucie && !req_r_empty && !tbl_full && hdr_crdt_avail;
-  assign ucie_tx_hdr = translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, present_tag},
-                                                 present_seq);
+  assign ucie_tx_hdr_valid = bridge_open_ucie && tx_presenting && hdr_crdt_avail;
+  assign ucie_tx_hdr = tx_is_snp_rsp ?
+      translate_snp_rsp_to_ucie(snp_rsp_r_data[CHI_SNPRSP_W-1:0],
+                                 snp_rsp_r_data[CHI_SNPRSP_W], tx_held_seq) :
+      translate_chi_req_to_ucie(req_r_data, {{(8-LTAG_W){1'b0}}, tx_held_tag}, tx_held_seq);
   assign hdr_fire = ucie_tx_hdr_valid && ucie_tx_hdr_ready;
 
   // QoS high-priority counter: increments when a header fires with QoS >= 8.
@@ -641,7 +703,7 @@ module chi_to_ucie_bridge #(
       qos_hi_cnt <= 16'h0;
     else if (!bridge_open_ucie)
       qos_hi_cnt <= 16'h0;
-    else if (hdr_fire && req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8)
+    else if (req_hdr_fire && req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8)
       qos_hi_cnt <= qos_hi_cnt + 1'b1;
   end
 
@@ -656,12 +718,19 @@ module chi_to_ucie_bridge #(
       qos_lo_stall_cnt <= qos_lo_stall_cnt + 1'b1;
   end
 
-  assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;
-  assign ucie_tx_data = translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
-                                                   present_dat_seq, tx_dat_beat_ctr, wq_front_size);
-  assign ucie_tx_data_be = (tx_dat_beat_ctr == 3'd0) ? wdat_r_data[CHI_DAT_BE_LSB +: BE_W]
-                                                      : {BE_W{1'b1}};
-  assign data_fire = ucie_tx_data_valid && ucie_tx_data_ready;
+  assign ucie_tx_data_valid = bridge_open_ucie && dat_crdt_avail &&
+      (tx_dat_is_snp ? !snp_dat_r_empty
+                     : (!wdat_r_empty && !wq_empty));
+  assign ucie_tx_data = tx_dat_is_snp ?
+      translate_snp_dat_to_ucie(snp_dat_r_data, sdq_front_txnid, present_dat_seq, tx_dat_beat_ctr) :
+      translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
+                                 present_dat_seq, tx_dat_beat_ctr, wq_front_size);
+  assign ucie_tx_data_be = (tx_dat_beat_ctr == 3'd0 && !tx_dat_is_snp) ?
+      wdat_r_data[CHI_DAT_BE_LSB +: BE_W] : {BE_W{1'b1}};
+  assign data_fire     = ucie_tx_data_valid && ucie_tx_data_ready;
+  assign snp_dat_last  = (tx_dat_beat_ctr == 3'd4);
+  assign snp_dat_fire  = data_fire && tx_dat_is_snp;
+  assign sdq_pop       = snp_dat_fire && snp_dat_last;
 
   // ---------------------------------------------------------------------------
   // UCIe -> CHI translation (RX); CHI identity restored from the table
@@ -753,7 +822,10 @@ module chi_to_ucie_bridge #(
     end
   endfunction
 
-  assign ucie_rx_hdr_ready = bridge_open_ucie && !rsp_w_full;
+  // §9: RX header routing — SNP packets go to snp_rx_fifo; everything else to rsp_fifo.
+  wire rx_hdr_is_snp = (ucie_rx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] == UCIE_PKT_KIND_SNP);
+  assign ucie_rx_hdr_ready = bridge_open_ucie &&
+      (rx_hdr_is_snp ? !snp_rx_w_full : !rsp_w_full);
   // Accept non-last beats unconditionally (they don't write the FIFO);
   // gate the last beat on FIFO space.  rx_dat_last is 0 at beat 0.
   assign ucie_rx_data_ready = bridge_open_ucie && (!rdat_w_full || !rx_dat_last);
@@ -805,7 +877,7 @@ module chi_to_ucie_bridge #(
   wire err_rsp_pop  = rsp_presenting && chi_rsp_ready && !rsp_src_dbid &&  rsp_src_err;
 
   async_fifo #(.WIDTH(CHI_RSP_W), .DEPTH(FIFO_DEPTH)) u_rsp_fifo (
-    .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire),
+    .w_clk(ucie_clk), .w_rst_n(ucie_rst_n), .w_en(rx_hdr_fire && !rx_hdr_is_snp),
     .w_data(translate_ucie_hdr_to_chi_rsp(ucie_rx_hdr, a_txnid, a_srcid, a_valid)), .w_full(rsp_w_full),
     .r_clk(clk), .r_rst_n(clk_rst_n), .r_en(rsp_pop),
     .r_data(rsp_r_data), .r_empty(rsp_r_empty)
@@ -834,6 +906,86 @@ module chi_to_ucie_bridge #(
 
   assign chi_comp_data_valid = !rdat_r_empty;
   assign chi_comp_data = rdat_r_data;
+
+  // ---------------------------------------------------------------------------
+  // §9: Snoop FIFOs, SDQ, and CHI SNP output
+  // ---------------------------------------------------------------------------
+
+  // u_snp_rx_fifo: incoming UCIe SNP → CHI SNP flit (ucie_clk write, clk read)
+  async_fifo #(.WIDTH(CHI_SNP_W), .DEPTH(FIFO_DEPTH)) u_snp_rx_fifo (
+    .w_clk(ucie_clk), .w_rst_n(ucie_rst_n),
+    .w_en(rx_hdr_fire && rx_hdr_is_snp),
+    .w_data(translate_ucie_snp_to_chi_snp(ucie_rx_hdr)),
+    .w_full(snp_rx_w_full),
+    .r_clk(clk), .r_rst_n(clk_rst_n),
+    .r_en(chi_snp_valid && chi_snp_ready),
+    .r_data(snp_rx_r_data), .r_empty(snp_rx_r_empty)
+  );
+  assign chi_snp_valid = !snp_rx_r_empty;
+  assign chi_snp_data  = snp_rx_r_data;
+
+  // u_snp_rsp_fifo: CHI SnpResp/SnpRespData → UCIe SNP_RSP header (clk write, ucie_clk read)
+  // Width = CHI_SNPRSP_W + 1 where bit[CHI_SNPRSP_W] is has_dat flag.
+  wire snp_rsp_w_en  = (chi_snp_rsp_valid && chi_snp_rsp_ready);
+  wire snp_rsp_dat_accept = (chi_snp_rsp_dat_valid && chi_snp_rsp_dat_ready);
+
+  // Build the stored snp_rsp word from either channel.
+  // SnpResp (no data): {1'b0, rsp_data}
+  // SnpRespData (with data): extract resp/txnid/srcid from the DAT flit, set has_dat=1.
+  wire [CHI_SNPRSP_W-1:0] snp_rsp_from_dat;
+  assign snp_rsp_from_dat[CHI_SNPRSP_RESP_LSB   +: CHI_SNPRSP_RESP_W]   =
+      chi_snp_rsp_dat_data[CHI_DAT_RESP_LSB +: CHI_SNPRSP_RESP_W];
+  assign snp_rsp_from_dat[CHI_SNPRSP_TXNID_LSB  +: CHI_SNPRSP_TXNID_W]  =
+      chi_snp_rsp_dat_data[CHI_DAT_TXNID_LSB +: CHI_SNPRSP_TXNID_W];
+  assign snp_rsp_from_dat[CHI_SNPRSP_OPCODE_LSB +: CHI_SNPRSP_OPCODE_W] = CHI_SNPRSP_OP;
+  assign snp_rsp_from_dat[CHI_SNPRSP_SRCID_LSB  +: CHI_SNPRSP_SRCID_W]  = {NODEID_W{1'b0}};
+
+  wire [CHI_SNPRSP_W:0] snp_rsp_w_data_norm = {1'b0, chi_snp_rsp_data};
+  wire [CHI_SNPRSP_W:0] snp_rsp_w_data_dat  = {1'b1, snp_rsp_from_dat};
+
+  // Push to snp_rsp_fifo from either source; dat-path takes priority on same cycle.
+  wire snp_rsp_fifo_push    = snp_rsp_dat_accept || snp_rsp_w_en;
+  wire [CHI_SNPRSP_W:0] snp_rsp_fifo_wdata = snp_rsp_dat_accept ? snp_rsp_w_data_dat
+                                                                  : snp_rsp_w_data_norm;
+
+  assign chi_snp_rsp_ready     = cap_open && !snp_rsp_w_full && !snp_rsp_dat_accept;
+  assign chi_snp_rsp_dat_ready = cap_open && !snp_rsp_w_full && !snp_dat_w_full;
+
+  async_fifo #(.WIDTH(CHI_SNPRSP_W+1), .DEPTH(FIFO_DEPTH)) u_snp_rsp_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n),
+    .w_en(snp_rsp_fifo_push),
+    .w_data(snp_rsp_fifo_wdata),
+    .w_full(snp_rsp_w_full),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n),
+    .r_en(snp_rsp_hdr_fire),
+    .r_data(snp_rsp_r_data), .r_empty(snp_rsp_r_empty)
+  );
+
+  // u_snp_dat_fifo: dirty writeback data (clk write, ucie_clk read)
+  async_fifo #(.WIDTH(CHI_DAT_W), .DEPTH(FIFO_DEPTH)) u_snp_dat_fifo (
+    .w_clk(clk), .w_rst_n(clk_rst_n),
+    .w_en(snp_rsp_dat_accept),
+    .w_data(chi_snp_rsp_dat_data),
+    .w_full(snp_dat_w_full),
+    .r_clk(ucie_clk), .r_rst_n(ucie_rst_n),
+    .r_en(snp_dat_fire && snp_dat_last),
+    .r_data(snp_dat_r_data), .r_empty(snp_dat_r_empty)
+  );
+
+  // Snoop data tag queue: push snp_txnid when a has_dat SNP_RSP header fires;
+  // pop when the last dirty data beat fires.
+  always @(posedge ucie_clk or negedge ucie_rst_n) begin
+    if (!ucie_rst_n) begin
+      sdq_wptr <= {(WQ_AW+1){1'b0}};
+      sdq_rptr <= {(WQ_AW+1){1'b0}};
+    end else begin
+      if (snp_rsp_hdr_fire && snp_rsp_r_data[CHI_SNPRSP_W]) begin
+        sdq_mem[sdq_wptr[WQ_AW-1:0]] <= snp_rsp_r_data[CHI_SNPRSP_TXNID_LSB +: TXNID_W];
+        sdq_wptr <= sdq_wptr + 1'b1;
+      end
+      if (sdq_pop) sdq_rptr <= sdq_rptr + 1'b1;
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // Error / status counters
@@ -870,7 +1022,7 @@ module chi_to_ucie_bridge #(
       assert (ucie_hdr_crc16_ok(ucie_tx_hdr));
       if (tx_dat_beat_ctr == 0)
         assert (ucie_hdr_crc16_ok(ucie_tx_data));
-      assert (!ucie_tx_data_valid || !wq_empty);
+      assert (!ucie_tx_data_valid || !wq_empty || !sdq_empty);
       // §6.1: data beat counter must not exceed the burst's last beat index.
       if (ucie_tx_data_valid)
         assert (tx_dat_beat_ctr <= wq_front_last_beat);
@@ -932,7 +1084,7 @@ module chi_to_ucie_bridge #(
   end
   always @(posedge ucie_clk) begin
     if (ucie_rst_n && f_ucie_past_valid) begin
-      if ($past(hdr_fire) && hdr_fire && !held_v &&
+      if ($past(hdr_fire) && hdr_fire && !tx_is_snp_rsp &&
           !$past(data_fire && (tx_dat_beat_ctr == 3'd0)))
         assert (ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB] ==
                 $past(ucie_tx_hdr[UCIE_SEQ_MSB:UCIE_SEQ_LSB]) + 8'h1);

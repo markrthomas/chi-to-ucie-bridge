@@ -19,6 +19,7 @@ module chi_to_ucie_bridge_sva (
   input wire [UCIE_DATA_W-1:0] tx_data,
   input wire [2:0]             tx_dat_beat_ctr,
   input wire                   wq_empty,
+  input wire                   sdq_empty,     // §9: snoop data queue empty
   input wire [3:0]             req_head_qos,  // QoS of the req_fifo head (§5.4)
   // CHI host clock domain (output completion channels)
   input wire                   clk_chi,    // clk
@@ -62,11 +63,10 @@ module chi_to_ucie_bridge_sva (
     (tx_hdr_valid && !tx_hdr_ready && open) |=> ($stable(tx_hdr) || !open)
   );
 
-  // Ordering: write data is never offered before its request header has been
-  // issued (i.e. its local tag is queued).
+  // Ordering: TX data is never offered without a pending write or snoop-data entry.
   a_data_after_hdr: assert property (
     @(posedge clk) disable iff (!rst_n)
-    tx_data_valid |-> !wq_empty
+    tx_data_valid |-> !wq_empty || !sdq_empty
   );
 
   // QoS routing (§5.4): every issued header carries the CHI REQ QoS[3:0] in
@@ -120,6 +120,7 @@ bind chi_to_ucie_bridge chi_to_ucie_bridge_sva u_sva (
   .tx_data(ucie_tx_data),
   .tx_dat_beat_ctr(tx_dat_beat_ctr),
   .wq_empty(wq_empty),
+  .sdq_empty(sdq_empty),
   .req_head_qos(req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W]),
   .clk_chi(clk),
   .rst_chi(clk_rst_n),

@@ -117,7 +117,9 @@ localparam integer CHI_DAT_W           = CHI_DAT_OPCODE_LSB  + CHI_DAT_OPCODE_W;
 localparam [3:0] UCIE_PKT_KIND_AD_REQ  = 4'h8;
 localparam [3:0] UCIE_PKT_KIND_AD_CPL  = 4'h9;
 localparam [3:0] UCIE_PKT_KIND_MEM_CPL = 4'ha;
+localparam [3:0] UCIE_PKT_KIND_SNP_RSP = 4'hb;  // §9: bridge → far: snoop response (header ± dirty data)
 localparam [3:0] UCIE_PKT_KIND_CMO     = 4'hc;  // §8: header-only cache-maintenance request
+localparam [3:0] UCIE_PKT_KIND_SNP     = 4'hd;  // §9: far → bridge: snoop request
 localparam [3:0] UCIE_PKT_KIND_ERROR   = 4'he;
 
 localparam [3:0] UCIE_MSG_MEM_RD       = 4'h3;
@@ -196,6 +198,43 @@ function automatic is_chi_cmo;
   end
 endfunction
 
+// ---- CHI SNP flit field map (§9: outgoing snoop to CHI master) ----
+localparam integer CHI_SNP_RETTOS_W  = 1;
+localparam integer CHI_SNP_DONOT_W   = 1;
+localparam integer CHI_SNP_SRCID_W   = NODEID_W;
+localparam integer CHI_SNP_TXNID_W   = TXNID_W;
+localparam integer CHI_SNP_ADDR_W    = CHI_UCIE_ADDR_W;
+localparam integer CHI_SNP_OPCODE_W  = 5;
+
+localparam integer CHI_SNP_RETTOS_LSB = 0;
+localparam integer CHI_SNP_DONOT_LSB  = CHI_SNP_RETTOS_LSB + CHI_SNP_RETTOS_W;
+localparam integer CHI_SNP_SRCID_LSB  = CHI_SNP_DONOT_LSB  + CHI_SNP_DONOT_W;
+localparam integer CHI_SNP_TXNID_LSB  = CHI_SNP_SRCID_LSB  + CHI_SNP_SRCID_W;
+localparam integer CHI_SNP_ADDR_LSB   = CHI_SNP_TXNID_LSB  + CHI_SNP_TXNID_W;
+localparam integer CHI_SNP_OPCODE_LSB = CHI_SNP_ADDR_LSB   + CHI_SNP_ADDR_W;
+localparam integer CHI_SNP_W          = CHI_SNP_OPCODE_LSB + CHI_SNP_OPCODE_W;
+// CHI_SNP_W = 1+1+7+8+48+5 = 70
+
+localparam [4:0] CHI_SNP_SNPONCE    = 5'h03;
+localparam [4:0] CHI_SNP_SNPCLEAN   = 5'h01;
+localparam [4:0] CHI_SNP_SNPUNIQUE  = 5'h07;
+localparam [4:0] CHI_SNP_SNPSHARED  = 5'h02;
+
+// ---- CHI SnpResp flit field map (§9: CHI master → bridge) ----
+localparam integer CHI_SNPRSP_RESP_W   = 3;
+localparam integer CHI_SNPRSP_TXNID_W  = TXNID_W;
+localparam integer CHI_SNPRSP_OPCODE_W = 4;
+localparam integer CHI_SNPRSP_SRCID_W  = NODEID_W;
+
+localparam integer CHI_SNPRSP_RESP_LSB   = 0;
+localparam integer CHI_SNPRSP_TXNID_LSB  = CHI_SNPRSP_RESP_LSB   + CHI_SNPRSP_RESP_W;
+localparam integer CHI_SNPRSP_OPCODE_LSB = CHI_SNPRSP_TXNID_LSB  + CHI_SNPRSP_TXNID_W;
+localparam integer CHI_SNPRSP_SRCID_LSB  = CHI_SNPRSP_OPCODE_LSB + CHI_SNPRSP_OPCODE_W;
+localparam integer CHI_SNPRSP_W          = CHI_SNPRSP_SRCID_LSB  + CHI_SNPRSP_SRCID_W;
+// CHI_SNPRSP_W = 3+8+4+7 = 22
+
+localparam [3:0] CHI_SNPRSP_OP = 4'h1;
+
 // 16-bit XOR integrity field: XOR of seven 16-bit slices of hdr[127:16].
 // Computed with crc field zeroed; placed in hdr[15:0].
 function automatic [15:0] ucie_crc16;
@@ -230,6 +269,73 @@ function automatic [UCIE_HDR_W-1:0] pack_ucie_hdr;
     raw = {kind, code, tag, attr, length, src_id, flit_seq, addr, 16'h0000, 16'h0000};
     raw[UCIE_CRC_MSB:UCIE_CRC_LSB] = ucie_crc16(raw);
     pack_ucie_hdr = raw;
+  end
+endfunction
+
+// §9: translate incoming UCIe SNP header → CHI SNP flit
+function automatic [CHI_SNP_W-1:0] translate_ucie_snp_to_chi_snp;
+  input [UCIE_HDR_W-1:0] hdr;
+  reg [CHI_SNP_W-1:0] snp;
+  begin
+    snp = {CHI_SNP_W{1'b0}};
+    snp[CHI_SNP_RETTOS_LSB]                      = hdr[UCIE_ATTR_LSB];
+    snp[CHI_SNP_DONOT_LSB]                       = hdr[UCIE_ATTR_LSB + 1];
+    snp[CHI_SNP_SRCID_LSB  +: CHI_SNP_SRCID_W]  = hdr[UCIE_ID_LSB   +: NODEID_W];
+    snp[CHI_SNP_TXNID_LSB  +: CHI_SNP_TXNID_W]  = hdr[UCIE_TAG_LSB  +: TXNID_W];
+    snp[CHI_SNP_ADDR_LSB   +: CHI_SNP_ADDR_W]   = hdr[UCIE_ADDR_LSB +: CHI_UCIE_ADDR_W];
+    snp[CHI_SNP_OPCODE_LSB +: CHI_SNP_OPCODE_W] = {1'b0, hdr[UCIE_CODE_LSB +: 4]};
+    translate_ucie_snp_to_chi_snp = snp;
+  end
+endfunction
+
+// §9: translate CHI SnpResp (header-only or derived from SnpRespData) → UCIe SNP_RSP header
+// code = {has_dat, resp[2:0]}: has_dat=1 means a dirty-line burst on data channel follows.
+function automatic [UCIE_HDR_W-1:0] translate_snp_rsp_to_ucie;
+  input [CHI_SNPRSP_W-1:0] rsp;
+  input                     has_dat;
+  input [7:0]               flit_seq;
+  begin
+    translate_snp_rsp_to_ucie = pack_ucie_hdr(
+      UCIE_PKT_KIND_SNP_RSP,
+      {has_dat, rsp[CHI_SNPRSP_RESP_LSB +: 3]},
+      rsp[CHI_SNPRSP_TXNID_LSB +: CHI_SNPRSP_TXNID_W],
+      48'h0,
+      8'h0,
+      {1'b0, rsp[CHI_SNPRSP_SRCID_LSB +: CHI_SNPRSP_SRCID_W]},
+      8'h0,
+      flit_seq
+    );
+  end
+endfunction
+
+// §9: translate dirty-line writeback beat → UCIe data channel flit
+// beat 0: data-burst header; beats 1-4: 128-bit slices of the 512-bit dirty line.
+function automatic [UCIE_DATA_W-1:0] translate_snp_dat_to_ucie;
+  input [CHI_DAT_W-1:0] dat;
+  input [7:0]            snp_txnid;
+  input [7:0]            flit_seq;
+  input [2:0]            beat;
+  begin
+    if (beat == 3'd0) begin
+      translate_snp_dat_to_ucie = pack_ucie_hdr(
+        UCIE_PKT_KIND_SNP_RSP,
+        {1'b1, dat[CHI_DAT_RESP_LSB +: 3]},
+        snp_txnid,
+        48'h0,
+        8'h40,
+        8'h0,
+        8'h0,
+        flit_seq
+      );
+    end else begin
+      case (beat)
+        3'd1:    translate_snp_dat_to_ucie = dat[CHI_DAT_DATA_LSB +   0 +: 128];
+        3'd2:    translate_snp_dat_to_ucie = dat[CHI_DAT_DATA_LSB + 128 +: 128];
+        3'd3:    translate_snp_dat_to_ucie = dat[CHI_DAT_DATA_LSB + 256 +: 128];
+        3'd4:    translate_snp_dat_to_ucie = dat[CHI_DAT_DATA_LSB + 384 +: 128];
+        default: translate_snp_dat_to_ucie = 128'h0;
+      endcase
+    end
   end
 endfunction
 

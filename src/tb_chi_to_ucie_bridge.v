@@ -63,6 +63,18 @@ module tb_chi_to_ucie_bridge;
   wire        pm_l1_active;
   wire [15:0] qos_hi_cnt;
   wire [15:0] qos_lo_stall_cnt;
+
+  // §9: Snoop channels
+  wire                 chi_snp_valid;
+  wire [CHI_SNP_W-1:0] chi_snp_data;
+  reg                  chi_snp_ready;
+  reg                  chi_snp_rsp_valid;
+  reg [CHI_SNPRSP_W-1:0] chi_snp_rsp_data;
+  wire                 chi_snp_rsp_ready;
+  reg                  chi_snp_rsp_dat_valid;
+  reg [CHI_DAT_W-1:0]  chi_snp_rsp_dat_data;
+  wire                 chi_snp_rsp_dat_ready;
+
   reg         err_inj_en;
   wire        drain_done;
   wire [15:0] crc_err_cnt;
@@ -125,6 +137,15 @@ module tb_chi_to_ucie_bridge;
     .err_inj_en(err_inj_en),
     .qos_hi_cnt(qos_hi_cnt),
     .qos_lo_stall_cnt(qos_lo_stall_cnt),
+    .chi_snp_valid(chi_snp_valid),
+    .chi_snp_data(chi_snp_data),
+    .chi_snp_ready(chi_snp_ready),
+    .chi_snp_rsp_valid(chi_snp_rsp_valid),
+    .chi_snp_rsp_data(chi_snp_rsp_data),
+    .chi_snp_rsp_ready(chi_snp_rsp_ready),
+    .chi_snp_rsp_dat_valid(chi_snp_rsp_dat_valid),
+    .chi_snp_rsp_dat_data(chi_snp_rsp_dat_data),
+    .chi_snp_rsp_dat_ready(chi_snp_rsp_dat_ready),
     .drain_done(drain_done),
     .crc_err_cnt(crc_err_cnt),
     .tag_err_cnt(tag_err_cnt),
@@ -166,6 +187,11 @@ module tb_chi_to_ucie_bridge;
       sb_rx_valid   = 1'b0;
       sb_rx_data    = 8'h00;
       err_inj_en = 1'b0;
+      chi_snp_ready         = 1'b1;
+      chi_snp_rsp_valid     = 1'b0;
+      chi_snp_rsp_data      = {CHI_SNPRSP_W{1'b0}};
+      chi_snp_rsp_dat_valid = 1'b0;
+      chi_snp_rsp_dat_data  = {CHI_DAT_W{1'b0}};
       repeat (8) @(posedge clk);
       rst_n = 1'b1;
       phy_init_done = 1'b1;
@@ -1000,6 +1026,148 @@ module tb_chi_to_ucie_bridge;
       join
       @(posedge clk);
       chi_req_valid = 1'b0;
+    end
+
+    $display("INFO: §9 snoop opcodes: UCIe SNP → chi_snp; SnpResp/SnpRespData → UCIe SNP_RSP");
+    begin : snoop_ops
+      reg [7:0]   snp_tag;
+      reg [47:0]  snp_addr;
+      reg [7:0]   snp_txnid;
+      reg [7:0]   snp_rsp_tag;
+      reg [511:0] dirty_data;
+      reg [UCIE_HDR_W-1:0] snp_ucie_hdr;
+      reg [7:0]   tx_kind;
+      integer     b;
+
+      snp_addr    = 48'hABCD_0000_1000;
+      snp_txnid   = 8'h42;
+      dirty_data  = 512'hDEADC0DE_CAFEBABE_12345678_9ABCDEF0_FEDCBA98_76543210_11223344_55667788;
+
+      // ---- Sub-test A: header-only SnpResp ----
+      // 1. Inject UCIe SNP packet on the rx header channel.
+      @(posedge ucie_clk);
+      snp_ucie_hdr = pack_ucie_hdr(
+        UCIE_PKT_KIND_SNP,  // kind=D
+        4'h7,               // code = SNP opcode lower 4 bits (SnpUnique opcode[3:0])
+        snp_txnid,          // tag = HN TxnID
+        snp_addr,           // addr
+        8'h40,              // length
+        8'h2A,              // src_id = HN SrcID
+        8'h00,              // attr[1:0] = DoNotGoToSD:RetToSrc = 0
+        8'h00               // flit_seq
+      );
+      ucie_rx_hdr = snp_ucie_hdr;
+      ucie_rx_hdr_valid = 1'b1;
+      while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk);
+      ucie_rx_hdr_valid = 1'b0;
+
+      // 2. CHI master sees chi_snp_valid with correct fields.
+      wait (chi_snp_valid);
+      #1;
+      if (chi_snp_data[CHI_SNP_TXNID_LSB +: CHI_SNP_TXNID_W] !== snp_txnid) begin
+        $display("FAIL: §9A: chi_snp TxnID mismatch (got %h exp %h)",
+                 chi_snp_data[CHI_SNP_TXNID_LSB +: CHI_SNP_TXNID_W], snp_txnid); $finish(1);
+      end
+      if (chi_snp_data[CHI_SNP_ADDR_LSB +: CHI_SNP_ADDR_W] !== snp_addr) begin
+        $display("FAIL: §9A: chi_snp addr mismatch (got %h exp %h)",
+                 chi_snp_data[CHI_SNP_ADDR_LSB +: CHI_SNP_ADDR_W], snp_addr); $finish(1);
+      end
+      if (chi_snp_data[CHI_SNP_SRCID_LSB +: CHI_SNP_SRCID_W] !== 7'h2A) begin
+        $display("FAIL: §9A: chi_snp SrcID mismatch"); $finish(1);
+      end
+
+      // 3. CHI master drives SnpResp (no dirty data, resp=I=0).
+      @(posedge clk);
+      chi_snp_rsp_data = {CHI_SNPRSP_W{1'b0}};
+      chi_snp_rsp_data[CHI_SNPRSP_RESP_LSB   +: CHI_SNPRSP_RESP_W]   = 3'b000; // I
+      chi_snp_rsp_data[CHI_SNPRSP_TXNID_LSB  +: CHI_SNPRSP_TXNID_W]  = snp_txnid;
+      chi_snp_rsp_data[CHI_SNPRSP_OPCODE_LSB +: CHI_SNPRSP_OPCODE_W] = CHI_SNPRSP_OP;
+      chi_snp_rsp_data[CHI_SNPRSP_SRCID_LSB  +: CHI_SNPRSP_SRCID_W]  = 7'h10;
+      chi_snp_rsp_valid = 1'b1;
+      while (!chi_snp_rsp_ready) @(posedge clk);
+      @(posedge clk);
+      chi_snp_rsp_valid = 1'b0;
+
+      // 4. Bridge must emit a UCIe SNP_RSP header (kind=B, has_dat=0, resp=I=0).
+      wait (ucie_tx_hdr_valid);
+      #1;
+      tx_kind = ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB];
+      if (tx_kind !== UCIE_PKT_KIND_SNP_RSP) begin
+        $display("FAIL: §9A: expected UCIe SNP_RSP header (got kind=%h)", tx_kind); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== 4'h0) begin  // has_dat=0, resp=I=0
+        $display("FAIL: §9A: SNP_RSP code mismatch (got %h exp 0h0)",
+                 ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB] !== snp_txnid) begin
+        $display("FAIL: §9A: SNP_RSP tag (HN TxnID) mismatch"); $finish(1);
+      end
+      // Data channel must stay idle (no dirty burst).
+      @(posedge ucie_clk); #1;
+      if (ucie_tx_data_valid) begin
+        $display("FAIL: §9A: unexpected data beat after header-only SnpResp"); $finish(1);
+      end
+      @(posedge ucie_clk);
+
+      // ---- Sub-test B: SnpRespData (dirty writeback) ----
+      // Inject a second SNP snoop.
+      snp_txnid = 8'h7F;
+      @(posedge ucie_clk);
+      snp_ucie_hdr = pack_ucie_hdr(
+        UCIE_PKT_KIND_SNP, 4'h1,          // SnpClean opcode[3:0]=1
+        snp_txnid, snp_addr, 8'h40, 8'h2A, 8'h00, 8'h00
+      );
+      ucie_rx_hdr = snp_ucie_hdr;
+      ucie_rx_hdr_valid = 1'b1;
+      while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk);
+      ucie_rx_hdr_valid = 1'b0;
+
+      // Wait for chi_snp_valid with new txnid.
+      wait (chi_snp_valid && chi_snp_data[CHI_SNP_TXNID_LSB +: CHI_SNP_TXNID_W] === snp_txnid);
+
+      // CHI master drives SnpRespData (resp=UD=3=3'b011, with dirty line).
+      @(posedge clk);
+      chi_snp_rsp_dat_data = {CHI_DAT_W{1'b0}};
+      chi_snp_rsp_dat_data[CHI_DAT_DATA_LSB   +: CHI_DAT_DATA_W]   = dirty_data;
+      chi_snp_rsp_dat_data[CHI_DAT_RESP_LSB   +: 3]                = 3'b011; // UD
+      chi_snp_rsp_dat_data[CHI_DAT_TXNID_LSB  +: CHI_DAT_TXNID_W]  = snp_txnid;
+      chi_snp_rsp_dat_data[CHI_DAT_OPCODE_LSB +: CHI_DAT_OPCODE_W] = 4'h1;  // SnpRespData
+      chi_snp_rsp_dat_valid = 1'b1;
+      while (!chi_snp_rsp_dat_ready) @(posedge clk);
+      @(posedge clk);
+      chi_snp_rsp_dat_valid = 1'b0;
+
+      // Bridge must emit UCIe SNP_RSP header with has_dat=1, resp=UD=3.
+      wait (ucie_tx_hdr_valid);
+      #1;
+      if (ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_SNP_RSP) begin
+        $display("FAIL: §9B: expected SNP_RSP header"); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== 4'hB) begin  // has_dat=1, resp=UD(3'b011)=3
+        $display("FAIL: §9B: SNP_RSP code mismatch (got %h exp 0xB)",
+                 ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB] !== snp_txnid) begin
+        $display("FAIL: §9B: SNP_RSP tag mismatch"); $finish(1);
+      end
+      @(posedge ucie_clk);
+
+      // Data burst: beat 0 = data-burst header, beats 1-4 = dirty line.
+      wait (ucie_tx_data_valid); #1;
+      if (ucie_tx_data[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_SNP_RSP) begin
+        $display("FAIL: §9B: data beat 0 kind mismatch"); $finish(1);
+      end
+      @(posedge ucie_clk);
+      for (b = 0; b < 4; b = b + 1) begin
+        #1;
+        if (ucie_tx_data !== dirty_data[b*128 +: 128]) begin
+          $display("FAIL: §9B: dirty data beat %0d mismatch (got %h exp %h)",
+                   b+1, ucie_tx_data, dirty_data[b*128 +: 128]); $finish(1);
+        end
+        @(posedge ucie_clk);
+      end
     end
 
     $display("PASS CHI-to-UCIe bridge directed smoke");
