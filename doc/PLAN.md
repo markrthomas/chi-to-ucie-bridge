@@ -689,6 +689,113 @@ direction.
 - Formal: all 5 SymbiYosys targets pass at BMC depth 8–12.
 - Synth: 42,720 cells (+245 vs Phase 7), no latches.
 
+## Phase 10 — QoS Throttling (branch: phase7-chi-deepening)
+
+Low-QoS requests were accepted unconditionally even when the outstanding-transaction
+window was saturated by high-QoS traffic. Phase 10 adds a watermark-based
+back-pressure mechanism that stalls low-priority CHI acceptance when the link is
+congested.
+
+### §10 QoS throttle implementation (done)
+
+**Parameter**: `QOS_THROTTLE_WM = MAX_OUTSTANDING / 2` (default 16).
+
+**CDC**: `outstanding_above_wm` bit computed in `ucie_clk` domain and synchronized
+to `clk` via `cdc_sync #(.STAGES(2)) u_qos_wm_cdc`.
+
+**Gate**: `throttle_lo = outstanding_above_wm_clk && !chi_req_is_qos_hi` (QoS ≥ 8
+is never throttled). Applied to `rd_req_ready`, `wr_req_ready`, and
+`cmo_req_ready`; the unsupported-opcode error path is never throttled.
+
+**New output**: `qos_lo_stall_cnt [15:0]` increments in the `clk` domain whenever
+`throttle_lo && chi_req_valid && !chi_req_is_qos_hi`. Resets on link close.
+
+**Verification**:
+- cocotb `test_qos_throttle`: issues 20 high-QoS reads to push `outstanding` past
+  WM, then asserts a low-QoS read and confirms `chi_req_ready` stays deasserted;
+  drains completions, then confirms low-QoS flows again. **18/18 PASS** (Verilator).
+- Formal: all 5 SymbiYosys targets pass.
+- Synth: 42,796 cells (+76 vs Phase 8), no latches. Commit: `6588b68`.
+
+---
+
+## Phase 9 — Snoop Opcodes (branch: phase7-chi-deepening)
+
+The far side needs to be able to send snoop requests (cache-invalidation / clean
+operations) back through the bridge to the CHI master. The CHI master responds
+with either a header-only `SnpResp` or a `SnpRespData` flit that carries a dirty
+512-bit cache line.
+
+### §9 Snoop implementation (done)
+
+**New packet kinds** (`src/chi_ucie_bridge_defs.vh`):
+
+| Constant | Value | Direction |
+|:---|:---|:---|
+| `UCIE_PKT_KIND_SNP` | `4'hD` | far → bridge: incoming snoop |
+| `UCIE_PKT_KIND_SNP_RSP` | `4'hB` | bridge → far: snoop response |
+
+**CHI SNP flit** (`CHI_SNP_W = 70`): fields RETTOS(1), DONOT(1), SRCID(7),
+TXNID(8), ADDR(48), OPCODE(5).
+
+**CHI SnpResp flit** (`CHI_SNPRSP_W = 22`): fields RESP(3), TXNID(8),
+OPCODE(4), SRCID(7). `CHI_SNPRSP_OP = 4'h1`.
+
+**New bridge ports** (`src/chi_to_ucie_bridge.v`):
+```
+chi_snp_valid / chi_snp_data [CHI_SNP_W-1:0] / chi_snp_ready
+chi_snp_rsp_valid / chi_snp_rsp_data [CHI_SNPRSP_W-1:0] / chi_snp_rsp_ready
+chi_snp_rsp_dat_valid / chi_snp_rsp_dat_data [CHI_DAT_W-1:0] / chi_snp_rsp_dat_ready
+```
+
+**Three new async FIFOs**:
+- `u_snp_rx_fifo` (w=ucie_clk, r=clk, WIDTH=CHI_SNP_W): stores translated CHI SNP
+  flits from incoming UCIe SNP packets.
+- `u_snp_rsp_fifo` (w=clk, r=ucie_clk, WIDTH=CHI_SNPRSP_W+1): stores SnpResp or
+  the SnpResp derived from SnpRespData. MSB = `has_dat` flag.
+- `u_snp_dat_fifo` (w=clk, r=ucie_clk, WIDTH=CHI_DAT_W): stores the dirty 512-bit
+  cache line from SnpRespData.
+
+**RX routing**: `rx_hdr_is_snp` gates incoming UCIe packets; SNP kind → `u_snp_rx_fifo`,
+all other kinds → `u_rsp_fifo` (was `rx_hdr_fire` unconditionally).
+
+**TX arbitration SM** (`tx_presenting` + `tx_is_snp_rsp`): replaces the old
+`held_v/held_tag/held_seq` pattern. Arbitrates two header sources — req and
+snp_rsp — with snp_rsp taking priority. Latches `tx_held_tag` and `tx_held_seq`
+on the 0→1 transition so they are stable across stall cycles.
+
+**SNP_RSP TX encoding**: `code = {has_dat, resp[2:0]}`.
+- Header-only `SnpResp` (resp=I, no data) → code = `4'h0`.
+- `SnpRespData` (resp=UD, has dirty data) → code = `4'hB`.
+
+**Snoop Data tag Queue (SDQ)**: analogous to `wtag_q` for writes. Pushed with
+`snp_txnid` when `snp_rsp_hdr_fire && has_dat`; popped when dirty-data last beat
+fires. Provides `sdq_front_txnid` to `translate_snp_dat_to_ucie` for the
+beat-0 data-descriptor header.
+
+**TX data mux**: `tx_dat_is_snp = !sdq_empty` — snoop dirty data takes priority
+over write data. `snp_dat_last = (tx_dat_beat_ctr == 3'd4)` (always 4 beats for a
+512-bit dirty line).
+
+**`all_empty`**: extended with `snp_rx_r_empty`, `snp_rsp_r_empty_clk` (2-flop
+CDC), `snp_dat_r_empty_clk` (2-flop CDC).
+
+**SVA** (`src/chi_to_ucie_bridge_sva.sv`): `a_data_after_hdr` updated to
+`tx_data_valid |-> !wq_empty || !sdq_empty`; `sdq_empty` added as a port.
+
+**Verification**:
+- Directed testbench (`src/tb_chi_to_ucie_bridge.v`): `§9` block exercises both
+  sub-cases: header-only `SnpResp` and `SnpRespData` dirty writeback with 5-beat
+  data burst check.
+- cocotb `test_snoop_basic` + `test_snoop_dirty`: inject UCIe SNP, verify
+  `chi_snp` fields, drive responses, check SNP_RSP header kind/code, stall-based
+  beat-by-beat data burst check. **20/20 PASS** (Verilator).
+- Formal: all 5 SymbiYosys targets pass.
+- Synth: 61,190 cells (+18,394 vs Phase 10 — three new FIFOs dominate), no
+  latches. Commit: `fc08f26`.
+
+---
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
