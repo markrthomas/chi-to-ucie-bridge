@@ -71,6 +71,13 @@ UCIE_PKT_KIND_MEM_CPL = 0xA
 UCIE_PKT_KIND_SNP_RSP = 0xB  # §9: snoop response (header ± dirty data)
 UCIE_PKT_KIND_CMO     = 0xC
 UCIE_PKT_KIND_SNP     = 0xD  # §9: incoming snoop request
+UCIE_PKT_KIND_ATOM    = 0xF  # §11: atomic request header + 1-beat operand data
+
+# §11: CHI atomic opcodes
+CHI_REQ_ATOMICSTORE_ADD  = 0x20  # atomic add, no return data
+CHI_REQ_ATOMICLOAD_ADD   = 0x28  # atomic add, returns old value
+CHI_REQ_ATOMICSWAP       = 0x30  # atomic exchange, returns old value
+CHI_REQ_ATOMICCOMPARE    = 0x31  # compare-and-swap, returns old value
 UCIE_MSG_MEM_RD       = 0x3
 UCIE_MSG_MEM_WR       = 0x4
 UCIE_MSG_MEM_WR_DATA  = 0x6
@@ -142,6 +149,27 @@ def make_chi_cmo(opcode, txnid, addr, srcid=0x12, size=6):
     flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
     flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
     flit |= (size  & 0x7)  << CHI_REQ_SIZE_LSB
+    return flit
+
+
+def make_chi_atomic_req(opcode, txnid, addr, srcid=0x3C, size=3):
+    """§11: Build a CHI atomic REQ flit (operand data follows via DBID handshake)."""
+    flit = 0
+    flit |= (opcode & 0x7F) << CHI_REQ_OPCODE_LSB
+    flit |= (addr & ((1 << 48) - 1)) << CHI_REQ_ADDR_LSB
+    flit |= (txnid & 0xFF) << CHI_REQ_TXNID_LSB
+    flit |= (srcid & 0x7F) << CHI_REQ_SRCID_LSB
+    flit |= (size  & 0x7)  << CHI_REQ_SIZE_LSB
+    return flit
+
+
+def make_chi_atomic_data(dbid, operand_lo64, be=0xFF):
+    """§11: Build the atomic operand DAT flit; operand packed in data[63:0]."""
+    flit = 0
+    flit |= (operand_lo64 & ((1 << 64) - 1)) << CHI_DAT_DATA_LSB
+    flit |= (be & 0xFF) << CHI_DAT_BE_LSB
+    flit |= (dbid & 0xFF) << CHI_DAT_TXNID_LSB
+    flit |= (CHI_DAT_NCBWRDATA & 0xF) << CHI_DAT_OPCODE_LSB
     return flit
 
 
@@ -1996,3 +2024,224 @@ async def test_snoop_dirty(dut):
     dut._log.info(
         "snoop_dirty: SnpRespData → SNP_RSP header + 5-beat dirty burst verified"
     )
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_atomic_store(dut):
+    """§11: AtomicStoreAdd — bridge relays as UCIE ATOM header + 1-beat operand,
+    far side returns AD_CPL, bridge forwards CHI Comp (no return data).
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 0   # hold to capture DBIDResp deterministically
+    dut.chi_comp_data_ready.value = 1
+
+    TXNID   = 0xA0
+    ADDR    = 0xAAAA_0000_0010
+    OPERAND = 0x0000_0000_0000_0042  # 64-bit add value
+
+    # Phase 1: CHI atomic REQ — bridge allocates DBID.
+    dut.chi_req_data.value  = make_chi_atomic_req(CHI_REQ_ATOMICSTORE_ADD, TXNID, ADDR)
+    dut.chi_req_valid.value = 1
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            dut.chi_req_valid.value = 0
+            break
+    else:
+        assert False, "chi_req_ready never asserted for AtomicStoreAdd"
+
+    # Bridge must NOT issue a UCIe header before operand data arrives.
+    await ClockCycles(dut.ucie_clk, 3)
+    assert dut.ucie_tx_hdr_valid.value == 0, "ATOM header issued before operand data"
+
+    # Capture DBIDResp.
+    dut.chi_rsp_ready.value = 1
+    dbid = None
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_rsp_valid.value == 1:
+            rsp = int(dut.chi_rsp_data.value)
+            assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_DBIDRESP, \
+                f"Expected DBIDResp, got opcode 0x{field(rsp, CHI_RSP_OPCODE_LSB, 4):X}"
+            assert field(rsp, CHI_RSP_TXNID_LSB, 8) == TXNID, \
+                f"DBIDResp TxnID=0x{field(rsp, CHI_RSP_TXNID_LSB, 8):X} want 0x{TXNID:X}"
+            dbid = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+            dut.chi_rsp_ready.value = 0
+            break
+    assert dbid is not None, "DBIDResp never received"
+
+    # Phase 2: operand data on chi_wr_data (DBID echoed in TxnID).
+    dut.chi_wr_data.value       = make_chi_atomic_data(dbid, OPERAND)
+    dut.chi_wr_data_valid.value = 1
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_wr_data_ready.value == 1:
+            dut.chi_wr_data_valid.value = 0
+            break
+    else:
+        assert False, "chi_wr_data_ready never asserted for AtomicStore operand"
+
+    # Bridge must now issue ATOM header (kind=0xF, code=AtomicStoreAdd[3:0]=0x0, attr[7]=0).
+    atom_tag = None
+    for _ in range(200):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            hdr = int(dut.ucie_tx_hdr.value)
+            assert field(hdr, UCIE_KIND_LSB, 4) == UCIE_PKT_KIND_ATOM, \
+                f"ATOM header kind=0x{field(hdr, UCIE_KIND_LSB, 4):X}"
+            assert field(hdr, UCIE_CODE_LSB, 4) == 0x0, \
+                f"ATOM code=0x{field(hdr, UCIE_CODE_LSB, 4):X} want 0x0 (StoreAdd)"
+            assert field(hdr, UCIE_ATTR_LSB + 7, 1) == 0, \
+                "AtomicStore has_ret bit (attr[7]) should be 0"
+            atom_tag = field(hdr, UCIE_TAG_LSB, 8)
+            break
+    assert atom_tag is not None, "UCIe ATOM header never seen"
+
+    # Data burst: 2 beats (beat 0 = ATOM descriptor, beat 1 = operand).
+    # Use stall pattern to read beats without racing the counter.
+    dut.ucie_tx_data_ready.value = 0
+    for beat in range(2):
+        for _ in range(100):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_data_valid.value == 1:
+                break
+        assert dut.ucie_tx_data_valid.value == 1, f"ATOM data beat {beat} never appeared"
+        dat = int(dut.ucie_tx_data.value)
+        if beat == 0:
+            assert field(dat, UCIE_KIND_LSB, 4) == UCIE_PKT_KIND_ATOM, \
+                f"beat 0 kind=0x{field(dat, UCIE_KIND_LSB, 4):X}"
+        else:
+            assert dat & ((1 << 64) - 1) == OPERAND, \
+                f"beat 1 operand=0x{dat & ((1 << 64)-1):016X} want 0x{OPERAND:016X}"
+        dut.ucie_tx_data_ready.value = 1
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_tx_data_ready.value = 0
+
+    # Far side: AD_CPL (AtomicStore has no return data).
+    await _send_rx_hdr(dut, pack_ucie_hdr(
+        UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, atom_tag, 0, 0, 0x55, 0, 0
+    ))
+
+    # Bridge must forward CHI Comp with TxnID=TXNID.
+    dut.chi_rsp_ready.value = 1
+    comp_seen = False
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_rsp_valid.value == 1:
+            rsp = int(dut.chi_rsp_data.value)
+            assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_COMP, \
+                f"Expected Comp, got 0x{field(rsp, CHI_RSP_OPCODE_LSB, 4):X}"
+            assert field(rsp, CHI_RSP_TXNID_LSB, 8) == TXNID, \
+                f"Comp TxnID=0x{field(rsp, CHI_RSP_TXNID_LSB, 8):X} want 0x{TXNID:X}"
+            comp_seen = True
+            break
+    assert comp_seen, "CHI Comp never seen for AtomicStoreAdd"
+    dut._log.info("atomic_store: AtomicStoreAdd → ATOM header + operand → AD_CPL → Comp OK")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_atomic_load(dut):
+    """§11: AtomicLoadAdd — bridge relays ATOM header + 1-beat operand,
+    far side returns MEM_CPL with 1 data beat, bridge forwards CHI CompData.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 0
+    dut.chi_comp_data_ready.value = 1
+
+    TXNID      = 0xB0
+    ADDR       = 0xBBBB_0000_0020
+    OPERAND    = 0x0000_0000_0000_0001   # add 1
+    RETURN_VAL = 0xDEAD_BEEF_0000_0000   # old value returned by far side
+
+    # Phase 1: CHI atomic REQ.
+    dut.chi_req_data.value  = make_chi_atomic_req(CHI_REQ_ATOMICLOAD_ADD, TXNID, ADDR)
+    dut.chi_req_valid.value = 1
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_req_ready.value == 1:
+            dut.chi_req_valid.value = 0
+            break
+    else:
+        assert False, "chi_req_ready never asserted for AtomicLoadAdd"
+
+    # Capture DBIDResp.
+    dut.chi_rsp_ready.value = 1
+    dbid = None
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_rsp_valid.value == 1:
+            rsp = int(dut.chi_rsp_data.value)
+            assert field(rsp, CHI_RSP_OPCODE_LSB, 4) == CHI_RSP_DBIDRESP
+            assert field(rsp, CHI_RSP_TXNID_LSB, 8) == TXNID
+            dbid = field(rsp, CHI_RSP_DBID_LSB, CHI_RSP_DBID_W)
+            dut.chi_rsp_ready.value = 0
+            break
+    assert dbid is not None, "DBIDResp never received"
+
+    # Phase 2: operand data.
+    dut.chi_wr_data.value       = make_chi_atomic_data(dbid, OPERAND)
+    dut.chi_wr_data_valid.value = 1
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_wr_data_ready.value == 1:
+            dut.chi_wr_data_valid.value = 0
+            break
+    else:
+        assert False, "chi_wr_data_ready never asserted for AtomicLoad operand"
+
+    # Bridge issues ATOM header (kind=0xF, code=0x8 for ATOMICLOAD_ADD[3:0], attr[7]=1).
+    atom_tag = None
+    for _ in range(200):
+        await RisingEdge(dut.ucie_clk)
+        if dut.ucie_tx_hdr_valid.value == 1:
+            hdr = int(dut.ucie_tx_hdr.value)
+            assert field(hdr, UCIE_KIND_LSB, 4) == UCIE_PKT_KIND_ATOM, \
+                f"ATOM header kind=0x{field(hdr, UCIE_KIND_LSB, 4):X}"
+            assert field(hdr, UCIE_CODE_LSB, 4) == 0x8, \
+                f"ATOM code=0x{field(hdr, UCIE_CODE_LSB, 4):X} want 0x8 (LoadAdd)"
+            assert field(hdr, UCIE_ATTR_LSB + 7, 1) == 1, \
+                "AtomicLoad has_ret bit (attr[7]) should be 1"
+            atom_tag = field(hdr, UCIE_TAG_LSB, 8)
+            break
+    assert atom_tag is not None, "UCIe ATOM header never seen for AtomicLoadAdd"
+
+    # Drain the 2-beat operand data burst (stall then fire each beat).
+    dut.ucie_tx_data_ready.value = 0
+    for beat in range(2):
+        for _ in range(100):
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_data_valid.value == 1:
+                break
+        assert dut.ucie_tx_data_valid.value == 1, f"ATOM operand beat {beat} stalled"
+        dut.ucie_tx_data_ready.value = 1
+        await RisingEdge(dut.ucie_clk)
+        dut.ucie_tx_data_ready.value = 0
+    dut.ucie_tx_data_ready.value = 1
+
+    # Far side: MEM_CPL with 1 data beat (length=0x10 → rx_burst_beats=1).
+    ret_beat = RETURN_VAL & ((1 << 128) - 1)
+    await _send_rx_data_burst(dut, [
+        pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, atom_tag,
+                      0, 0x10, 0x55, 0, 0),
+        ret_beat,
+    ])
+
+    # Bridge must forward CHI CompData with TxnID=TXNID and return value.
+    comp_seen = False
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if dut.chi_comp_data_valid.value == 1:
+            dat = int(dut.chi_comp_data.value)
+            assert field(dat, CHI_DAT_TXNID_LSB, 8) == TXNID, \
+                f"CompData TxnID=0x{field(dat, CHI_DAT_TXNID_LSB, 8):X} want 0x{TXNID:X}"
+            got_ret = field(dat, CHI_DAT_DATA_LSB, 64)
+            assert got_ret == RETURN_VAL, \
+                f"CompData return val=0x{got_ret:016X} want 0x{RETURN_VAL:016X}"
+            comp_seen = True
+            break
+    assert comp_seen, "CHI CompData never seen for AtomicLoadAdd"
+    dut._log.info("atomic_load: AtomicLoadAdd → ATOM header + operand → MEM_CPL → CompData OK")

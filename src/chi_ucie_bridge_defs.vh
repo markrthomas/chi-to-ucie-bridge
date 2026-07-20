@@ -46,6 +46,11 @@ localparam [6:0] CHI_REQ_CLEANSHARED        = 7'h08;
 localparam [6:0] CHI_REQ_CLEANSHAREDPERSIST = 7'h11;
 localparam [6:0] CHI_REQ_CLEANINVALID       = 7'h09;
 localparam [6:0] CHI_REQ_MAKEINVALID        = 7'h0D;
+// §11: Atomic opcodes (range 0x20–0x31)
+localparam [6:0] CHI_REQ_ATOMICSTORE_ADD    = 7'h20;  // atomic add, no return data
+localparam [6:0] CHI_REQ_ATOMICLOAD_ADD     = 7'h28;  // atomic add, returns old value
+localparam [6:0] CHI_REQ_ATOMICSWAP         = 7'h30;  // atomic exchange, returns old value
+localparam [6:0] CHI_REQ_ATOMICCOMPARE      = 7'h31;  // compare-and-swap, returns old value
 
 localparam [3:0] CHI_RSP_COMP            = 4'h4;
 localparam [3:0] CHI_RSP_DBIDRESP        = 4'h3;
@@ -121,6 +126,7 @@ localparam [3:0] UCIE_PKT_KIND_SNP_RSP = 4'hb;  // §9: bridge → far: snoop re
 localparam [3:0] UCIE_PKT_KIND_CMO     = 4'hc;  // §8: header-only cache-maintenance request
 localparam [3:0] UCIE_PKT_KIND_SNP     = 4'hd;  // §9: far → bridge: snoop request
 localparam [3:0] UCIE_PKT_KIND_ERROR   = 4'he;
+localparam [3:0] UCIE_PKT_KIND_ATOM    = 4'hf;  // §11: bridge → far: atomic REQ + 1-beat operand data
 
 localparam [3:0] UCIE_MSG_MEM_RD       = 4'h3;
 localparam [3:0] UCIE_MSG_MEM_WR       = 4'h4;
@@ -194,6 +200,31 @@ function automatic is_chi_cmo;
       CHI_REQ_CLEANINVALID,
       CHI_REQ_MAKEINVALID: is_chi_cmo = 1'b1;
       default:             is_chi_cmo = 1'b0;
+    endcase
+  end
+endfunction
+
+// §11: any atomic (Store, Load, Swap, Compare)
+function automatic is_chi_atomic;
+  input [6:0] opcode;
+  begin
+    case (opcode)
+      CHI_REQ_ATOMICSTORE_ADD,
+      CHI_REQ_ATOMICLOAD_ADD,
+      CHI_REQ_ATOMICSWAP,
+      CHI_REQ_ATOMICCOMPARE: is_chi_atomic = 1'b1;
+      default:               is_chi_atomic = 1'b0;
+    endcase
+  end
+endfunction
+
+// §11: AtomicStore only — no return data; far side answers with AD_CPL.
+function automatic is_chi_atomic_store;
+  input [6:0] opcode;
+  begin
+    case (opcode)
+      CHI_REQ_ATOMICSTORE_ADD: is_chi_atomic_store = 1'b1;
+      default:                 is_chi_atomic_store = 1'b0;
     endcase
   end
 endfunction

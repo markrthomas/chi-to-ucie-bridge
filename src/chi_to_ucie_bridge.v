@@ -287,12 +287,13 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   // CHI host-domain enqueue
   // ---------------------------------------------------------------------------
-  wire chi_req_is_write  = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire chi_req_is_read   = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire chi_req_is_cmo    = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire req_supported     = chi_req_is_write || chi_req_is_read || chi_req_is_cmo;
-  wire chi_req_is_qos_hi = chi_req_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8;  // §10
-  wire throttle_lo       = outstanding_above_wm_clk && !chi_req_is_qos_hi;             // §10
+  wire chi_req_is_write   = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire chi_req_is_read    = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire chi_req_is_cmo     = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire chi_req_is_atomic  = is_chi_atomic(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);  // §11
+  wire req_supported      = chi_req_is_write || chi_req_is_read || chi_req_is_cmo || chi_req_is_atomic;
+  wire chi_req_is_qos_hi  = chi_req_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8;  // §10
+  wire throttle_lo        = outstanding_above_wm_clk && !chi_req_is_qos_hi;             // §10
 
   // §7.1: an unsupported opcode is accepted and answered with a CHI RSP carrying
   // RespErr (NDERR) via a local clk-domain error-response FIFO, instead of the
@@ -334,28 +335,30 @@ module chi_to_ucie_bridge #(
   wire [WBUF_AW-1:0] wr_dbid    = chi_wr_data[CHI_DAT_TXNID_LSB +: WBUF_AW];
   wire               wr_dat_hit = dbid_valid[wr_dbid];
 
-  wire rd_req_ready  = chi_req_is_read  && cap_open && !req_w_full  && !throttle_lo;
-  wire wr_req_ready  = chi_req_is_write && cap_open && !dbid_pool_full && !dbid_rsp_w_full && !throttle_lo;
-  wire err_req_ready = chi_req_is_err   && cap_open && !err_rsp_w_full;
-  wire cmo_req_ready = chi_req_is_cmo   && cap_open && !req_w_full   && !throttle_lo;  // §8
-  wire wr_dat_ready  = wr_dat_hit       && cap_open && !req_w_full && !wdat_w_full;
+  wire rd_req_ready   = chi_req_is_read   && cap_open && !req_w_full  && !throttle_lo;
+  wire wr_req_ready   = chi_req_is_write  && cap_open && !dbid_pool_full && !dbid_rsp_w_full && !throttle_lo;
+  wire err_req_ready  = chi_req_is_err    && cap_open && !err_rsp_w_full;
+  wire cmo_req_ready  = chi_req_is_cmo    && cap_open && !req_w_full   && !throttle_lo;  // §8
+  wire atom_req_ready = chi_req_is_atomic && cap_open && !dbid_pool_full && !dbid_rsp_w_full && !throttle_lo;  // §11
+  wire wr_dat_ready   = wr_dat_hit        && cap_open && !req_w_full && !wdat_w_full;
 
-  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready;
+  assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready || atom_req_ready;
   assign chi_wr_data_ready = wr_dat_ready;
 
-  wire rd_req_accept  = chi_req_valid     && rd_req_ready;   // read: single-phase enqueue
-  wire wr_req_accept  = chi_req_valid     && wr_req_ready;   // write phase 1: alloc DBID
-  wire err_rsp_accept = chi_req_valid     && err_req_ready;  // §7.1 reject
-  wire cmo_req_accept = chi_req_valid     && cmo_req_ready;  // §8 CMO: single-phase enqueue
-  wire wr_dat_accept  = chi_wr_data_valid && wr_dat_ready;   // write phase 2: enqueue
+  wire rd_req_accept   = chi_req_valid     && rd_req_ready;    // read: single-phase enqueue
+  wire wr_req_accept   = chi_req_valid     && wr_req_ready;    // write phase 1: alloc DBID
+  wire err_rsp_accept  = chi_req_valid     && err_req_ready;   // §7.1 reject
+  wire cmo_req_accept  = chi_req_valid     && cmo_req_ready;   // §8 CMO: single-phase enqueue
+  wire atom_req_accept = chi_req_valid     && atom_req_ready;  // §11 atomic phase 1: alloc DBID
+  wire wr_dat_accept   = chi_wr_data_valid && wr_dat_ready;    // write/atomic phase 2: enqueue
 
-  // req_fifo enqueue: reads/CMOs push their request now; writes push the *stored*
-  // request when their WriteData arrives (so header and data enter together).
+  // req_fifo enqueue: reads/CMOs push their request now; writes and atomics push
+  // the *stored* request when their WriteData arrives (so header and data enter together).
   wire                 req_w_en   = rd_req_accept || wr_dat_accept || cmo_req_accept;
   wire [CHI_REQ_W-1:0] req_w_data = wr_dat_accept ? wpend_req[wr_dbid] : chi_req_data;
-  wire                 wdat_w_en  = wr_dat_accept;
+  wire                 wdat_w_en     = wr_dat_accept;
   wire                 err_rsp_w_en  = err_rsp_accept;
-  wire                 dbid_rsp_w_en = wr_req_accept;
+  wire                 dbid_rsp_w_en = wr_req_accept || atom_req_accept;  // §11: atomics also need DBID
 
   always @(posedge clk or negedge clk_rst_n) begin
     if (!clk_rst_n) begin
@@ -363,12 +366,12 @@ module chi_to_ucie_bridge #(
     end else begin
       // Alloc and free target different slots (alloc picks a free one, free a
       // valid one), so same-cycle alloc+free never conflict.
-      if (wr_req_accept) dbid_valid[dbid_alloc] <= 1'b1;
-      if (wr_dat_accept) dbid_valid[wr_dbid]    <= 1'b0;
+      if (wr_req_accept || atom_req_accept) dbid_valid[dbid_alloc] <= 1'b1;
+      if (wr_dat_accept)                    dbid_valid[wr_dbid]    <= 1'b0;
     end
   end
   always @(posedge clk) begin
-    if (wr_req_accept) wpend_req[dbid_alloc] <= chi_req_data;
+    if (wr_req_accept || atom_req_accept) wpend_req[dbid_alloc] <= chi_req_data;
   end
 
   async_fifo #(.WIDTH(CHI_REQ_W), .DEPTH(FIFO_DEPTH)) u_req_fifo (
@@ -386,8 +389,9 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   // Transaction table (ucie_clk domain)
   // ---------------------------------------------------------------------------
-  wire                req_head_is_write = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire                req_head_is_cmo   = is_chi_cmo(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire                req_head_is_write  = is_chi_write(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire                req_head_is_cmo    = is_chi_cmo(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire                req_head_is_atomic = is_chi_atomic(req_r_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);  // §11
   wire [LTAG_W-1:0]   free_tag;
   wire                tbl_full;
   wire                tbl_tag_err;
@@ -518,12 +522,14 @@ module chi_to_ucie_bridge #(
   // to data issue and enforces header-before-data ordering on the independent
   // ready paths.
   // ---------------------------------------------------------------------------
-  reg [LTAG_W+2:0] wtag_mem [0:MAX_OUTSTANDING-1];  // §6.1: {size[2:0], tag[LTAG_W-1:0]}
+  // §11: wq mem widened by 1 bit: {is_atom, size[2:0], tag[LTAG_W-1:0]}
+  reg [LTAG_W+3:0] wtag_mem [0:MAX_OUTSTANDING-1];
   reg [WQ_AW:0]    wq_wptr;
   reg [WQ_AW:0]    wq_rptr;
   wire wq_empty = (wq_wptr == wq_rptr);
-  wire [LTAG_W-1:0] wq_front      = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W-1:0];
-  wire [2:0]         wq_front_size = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W+2:LTAG_W];
+  wire [LTAG_W-1:0] wq_front         = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W-1:0];
+  wire [2:0]         wq_front_size    = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W+2:LTAG_W];
+  wire               wq_front_is_atom = wtag_mem[wq_rptr[WQ_AW-1:0]][LTAG_W+3];  // §11
 
   // §6.1: last data-beat index from CHI size.
   // size=0..4 (≤16B) → 1 beat, size=5 (32B) → 2 beats, size=6 (64B) → 4 beats.
@@ -539,7 +545,8 @@ module chi_to_ucie_bridge #(
   assign tx_dat_last        = tx_dat_is_snp ? snp_dat_last
                                             : (tx_dat_beat_ctr == wq_front_last_beat);
 
-  wire wq_push = req_hdr_fire && req_head_is_write;
+  // §11: atomics also push to wq (1-beat operand data burst follows the header).
+  wire wq_push = req_hdr_fire && (req_head_is_write || req_head_is_atomic);
   wire wq_pop  = data_fire && tx_dat_last && !tx_dat_is_snp;
 
   always @(posedge ucie_clk or negedge ucie_rst_n) begin
@@ -548,7 +555,8 @@ module chi_to_ucie_bridge #(
       wq_rptr <= {(WQ_AW+1){1'b0}};
     end else begin
       if (wq_push) begin
-        wtag_mem[wq_wptr[WQ_AW-1:0]] <= {req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W], tx_held_tag};
+        wtag_mem[wq_wptr[WQ_AW-1:0]] <=
+            {req_head_is_atomic, req_r_data[CHI_REQ_SIZE_LSB +: CHI_REQ_SIZE_W], tx_held_tag};
         wq_wptr <= wq_wptr + 1'b1;
       end
       if (wq_pop) wq_rptr <= wq_rptr + 1'b1;
@@ -630,18 +638,24 @@ module chi_to_ucie_bridge #(
     reg [3:0] code;
     reg [7:0] attr;
     begin
-      // §8: CMO → UCIE_PKT_KIND_CMO; code carries the lower 4 bits of the CHI
-      // opcode (CleanShared=0x8, CleanInvalid=0x9, MakeInvalid=0xD,
-      // CleanSharedPersist=0x1). No data burst follows; far side returns AD_CPL.
+      // §8: CMO → UCIE_PKT_KIND_CMO; code = lower 4 bits of CHI opcode.
       if (is_chi_cmo(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W])) begin
         kind = UCIE_PKT_KIND_CMO;
+        code = chi_req[CHI_REQ_OPCODE_LSB +: 4];
+      // §11: Atomic → UCIE_PKT_KIND_ATOM; code = lower 4 bits of CHI opcode.
+      // attr[7] = has_ret (1 for Load/Swap/Compare, 0 for Store).
+      end else if (is_chi_atomic(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W])) begin
+        kind = UCIE_PKT_KIND_ATOM;
         code = chi_req[CHI_REQ_OPCODE_LSB +: 4];
       end else begin
         kind = UCIE_PKT_KIND_AD_REQ;
         code = is_chi_write(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]) ?
                UCIE_MSG_MEM_WR : UCIE_MSG_MEM_RD;
       end
-      attr = {2'b00,
+      // attr[7]=has_ret (atomic only), attr[6]=0, attr[5:4]=order, attr[3:0]=QoS.
+      attr = {!is_chi_atomic_store(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]) &&
+               is_chi_atomic(chi_req[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]),
+              1'b0,
               chi_req[CHI_REQ_ORDER_LSB +: CHI_REQ_ORDER_W],
               chi_req[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W]};  // §5.4: attr[3:0] = QoS
       translate_chi_req_to_ucie = pack_ucie_hdr(
@@ -662,13 +676,14 @@ module chi_to_ucie_bridge #(
     input [7:0]           local_tag;
     input [7:0]           flit_seq;
     input [2:0]           beat;
-    input [2:0]           size;   // §6.1: CHI size field; drives length = 1 << size
+    input [2:0]           size;    // §6.1: CHI size field; drives length = 1 << size
+    input                 is_atom; // §11: 1 → atomic operand, beat-0 uses UCIE_PKT_KIND_ATOM
     reg [UCIE_HDR_W-1:0] hdr;
     begin
       if (beat == 3'd0) begin
         hdr = pack_ucie_hdr(
-          UCIE_PKT_KIND_AD_REQ,
-          UCIE_MSG_MEM_WR_DATA,
+          is_atom ? UCIE_PKT_KIND_ATOM : UCIE_PKT_KIND_AD_REQ,
+          is_atom ? 4'h0              : UCIE_MSG_MEM_WR_DATA,
           local_tag,
           48'h0000_0000_0000,
           (8'h01 << size),   // §6.1: byte count = 2^size
@@ -724,7 +739,7 @@ module chi_to_ucie_bridge #(
   assign ucie_tx_data = tx_dat_is_snp ?
       translate_snp_dat_to_ucie(snp_dat_r_data, sdq_front_txnid, present_dat_seq, tx_dat_beat_ctr) :
       translate_chi_data_to_ucie(wdat_r_data, {{(8-LTAG_W){1'b0}}, wq_front},
-                                 present_dat_seq, tx_dat_beat_ctr, wq_front_size);
+                                 present_dat_seq, tx_dat_beat_ctr, wq_front_size, wq_front_is_atom);
   assign ucie_tx_data_be = (tx_dat_beat_ctr == 3'd0 && !tx_dat_is_snp) ?
       wdat_r_data[CHI_DAT_BE_LSB +: BE_W] : {BE_W{1'b1}};
   assign data_fire     = ucie_tx_data_valid && ucie_tx_data_ready;

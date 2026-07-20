@@ -1170,6 +1170,181 @@ module tb_chi_to_ucie_bridge;
       end
     end
 
+    $display("INFO: §11 atomic opcodes: AtomicStoreAdd (no ret) + AtomicLoadAdd (ret data)");
+    begin : atomic_ops
+      reg [CHI_RSP_DBID_W-1:0] atom_dbid;
+      reg [7:0] atom_tag;
+      reg [127:0] atom_ret;  // return value from far side
+
+      // ---- §11A: AtomicStoreAdd — no return data ----
+      // Phase 1: REQ only; bridge allocates DBID and returns DBIDResp.
+      chi_rsp_ready = 1'b0;
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_ATOMICSTORE_ADD;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'hAAAA_0000_0010;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hA0;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h3C;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h3;  // 8 bytes
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      // Bridge must NOT issue UCIe header before operand data arrives.
+      #1;
+      if (ucie_tx_hdr_valid) begin
+        $display("FAIL: §11A: ATOM header before operand data"); $finish(1);
+      end
+      // Consume DBIDResp.
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_DBIDRESP))
+        @(posedge clk);
+      atom_dbid = chi_rsp_data[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W];
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hA0) begin
+        $display("FAIL: §11A: DBIDResp TxnID mismatch (got %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]); $finish(1);
+      end
+      chi_rsp_ready = 1'b1;
+      @(posedge clk);
+
+      // Phase 2: operand data (atomic add value = 0x42) on chi_wr_data.
+      chi_wr_data = {CHI_DAT_W{1'b0}};
+      chi_wr_data[CHI_DAT_OPCODE_LSB  +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
+      chi_wr_data[CHI_DAT_TXNID_LSB   +: CHI_DAT_TXNID_W]  = {{(TXNID_W-CHI_RSP_DBID_W){1'b0}}, atom_dbid};
+      chi_wr_data[CHI_DAT_BE_LSB      +: CHI_DAT_BE_W]     = 64'hFF;
+      chi_wr_data[CHI_DAT_DATA_LSB    +: 64]                = 64'h0000_0000_0000_0042;
+      chi_wr_data_valid = 1'b1;
+      while (!chi_wr_data_ready) @(posedge clk);
+      @(posedge clk);
+      chi_wr_data_valid = 1'b0;
+
+      // Bridge must now issue ATOM header (kind=0xF, code=ATOMICSTORE_ADD[3:0]=0x0).
+      wait (ucie_tx_hdr_valid);
+      if (ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_ATOM) begin
+        $display("FAIL: §11A: expected ATOM header kind (got %h)",
+                 ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB]); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== 4'h0) begin  // opcode[3:0]=0x0
+        $display("FAIL: §11A: ATOM header code mismatch (got %h)",
+                 ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_ATTR_MSB]) begin  // attr[7]=has_ret must be 0 for Store
+        $display("FAIL: §11A: AtomicStore has_ret bit should be 0"); $finish(1);
+      end
+      atom_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+      // Data burst beat 0: must be ATOM descriptor.
+      wait (ucie_tx_data_valid); #1;
+      if (ucie_tx_data[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_ATOM) begin
+        $display("FAIL: §11A: data beat 0 kind mismatch (got %h)",
+                 ucie_tx_data[UCIE_KIND_MSB:UCIE_KIND_LSB]); $finish(1);
+      end
+      @(posedge ucie_clk); #1;  // advance past beat 0; beat 1 now presented
+      // Beat 1: raw operand data (42 in [63:0]).
+      if (ucie_tx_data[63:0] !== 64'h0000_0000_0000_0042) begin
+        $display("FAIL: §11A: operand data mismatch (got %h)", ucie_tx_data[63:0]); $finish(1);
+      end
+      @(posedge ucie_clk);
+
+      // Far side: AD_CPL (no return data for AtomicStore).
+      ucie_rx_hdr = pack_ucie_hdr(UCIE_PKT_KIND_AD_CPL, UCIE_CPL_SC, atom_tag,
+                                  48'h0, 8'h00, 8'h55, 8'h00, 8'h00);
+      ucie_rx_hdr_valid = 1'b1;
+      while (!ucie_rx_hdr_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk);
+      ucie_rx_hdr_valid = 1'b0;
+      // Bridge must forward Comp with TxnID=0xA0.
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_COMP))
+        @(posedge clk);
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hA0) begin
+        $display("FAIL: §11A: Comp TxnID not restored (got %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]); $finish(1);
+      end
+      @(posedge clk);
+
+      // ---- §11B: AtomicLoadAdd — has return data ----
+      chi_rsp_ready = 1'b0;
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_ATOMICLOAD_ADD;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'hBBBB_0000_0020;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hB0;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h3D;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h3;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      while (!(chi_rsp_valid &&
+               chi_rsp_data[CHI_RSP_OPCODE_LSB +: CHI_RSP_OPCODE_W] == CHI_RSP_DBIDRESP))
+        @(posedge clk);
+      atom_dbid = chi_rsp_data[CHI_RSP_DBID_LSB +: CHI_RSP_DBID_W];
+      if (chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W] !== 8'hB0) begin
+        $display("FAIL: §11B: DBIDResp TxnID mismatch (got %h)",
+                 chi_rsp_data[CHI_RSP_TXNID_LSB +: CHI_RSP_TXNID_W]); $finish(1);
+      end
+      chi_rsp_ready = 1'b1;
+      @(posedge clk);
+
+      chi_wr_data = {CHI_DAT_W{1'b0}};
+      chi_wr_data[CHI_DAT_OPCODE_LSB  +: CHI_DAT_OPCODE_W] = CHI_DAT_NCBWRDATA;
+      chi_wr_data[CHI_DAT_TXNID_LSB   +: CHI_DAT_TXNID_W]  = {{(TXNID_W-CHI_RSP_DBID_W){1'b0}}, atom_dbid};
+      chi_wr_data[CHI_DAT_BE_LSB      +: CHI_DAT_BE_W]     = 64'hFF;
+      chi_wr_data[CHI_DAT_DATA_LSB    +: 64]                = 64'h0000_0000_0000_0001;
+      chi_wr_data_valid = 1'b1;
+      while (!chi_wr_data_ready) @(posedge clk);
+      @(posedge clk);
+      chi_wr_data_valid = 1'b0;
+
+      // Bridge issues ATOM header (code=0x8 for ATOMICLOAD_ADD[3:0], attr[7]=1 for has_ret).
+      wait (ucie_tx_hdr_valid);
+      if (ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB] !== UCIE_PKT_KIND_ATOM) begin
+        $display("FAIL: §11B: expected ATOM header kind (got %h)",
+                 ucie_tx_hdr[UCIE_KIND_MSB:UCIE_KIND_LSB]); $finish(1);
+      end
+      if (ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB] !== 4'h8) begin  // ATOMICLOAD_ADD[3:0]=0x8
+        $display("FAIL: §11B: ATOM header code mismatch (got %h exp 8)",
+                 ucie_tx_hdr[UCIE_CODE_MSB:UCIE_CODE_LSB]); $finish(1);
+      end
+      if (!ucie_tx_hdr[UCIE_ATTR_MSB]) begin  // attr[7]=has_ret must be 1 for Load
+        $display("FAIL: §11B: AtomicLoad has_ret bit should be 1"); $finish(1);
+      end
+      atom_tag = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+      // Drain the 2-beat operand data burst (beat 0 descriptor + beat 1 operand).
+      wait (ucie_tx_data_valid); #1;
+      @(posedge ucie_clk); #1;  // fires beat 0
+      @(posedge ucie_clk); #1;  // fires beat 1 (last)
+
+      // Far side: MEM_CPL with 1 data beat (length=0x10 → rx_burst_beats=1).
+      // Return value = 0xDEADBEEF_00000000 in [63:0].
+      atom_ret = {64'h0, 64'hDEAD_BEEF_0000_0000};
+      ucie_rx_data = pack_ucie_hdr(UCIE_PKT_KIND_MEM_CPL, UCIE_CPL_SC, atom_tag,
+                                   48'h0, 8'h10, 8'h55, 8'h00, 8'h00);
+      ucie_rx_data_valid = 1'b1;
+      while (!ucie_rx_data_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk); #1;
+      ucie_rx_data = atom_ret;
+      while (!ucie_rx_data_ready) @(posedge ucie_clk);
+      @(posedge ucie_clk); #1;
+      ucie_rx_data_valid = 1'b0;
+
+      // Bridge must forward CompData with the return value.
+      chi_comp_data_ready = 1'b1;
+      while (!chi_comp_data_valid) @(posedge clk);
+      if (chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W] !== 8'hB0) begin
+        $display("FAIL: §11B: CompData TxnID not restored (got %h)",
+                 chi_comp_data[CHI_DAT_TXNID_LSB +: CHI_DAT_TXNID_W]); $finish(1);
+      end
+      if (chi_comp_data[CHI_DAT_DATA_LSB +: 64] !== 64'hDEAD_BEEF_0000_0000) begin
+        $display("FAIL: §11B: CompData return value mismatch (got %h)",
+                 chi_comp_data[CHI_DAT_DATA_LSB +: 64]); $finish(1);
+      end
+      @(posedge clk);
+      chi_comp_data_ready = 1'b0;
+    end
+
     $display("PASS CHI-to-UCIe bridge directed smoke");
     $finish(0);
   end
