@@ -62,6 +62,7 @@ module tb_chi_to_ucie_bridge;
   wire        sb_rx_ready;
   wire        pm_l1_active;
   wire [15:0] qos_hi_cnt;
+  wire [15:0] qos_lo_stall_cnt;
   reg         err_inj_en;
   wire        drain_done;
   wire [15:0] crc_err_cnt;
@@ -75,7 +76,8 @@ module tb_chi_to_ucie_bridge;
   reg [7:0] tag_b;
 
   chi_to_ucie_bridge #(
-    .FIFO_DEPTH(FIFO_DEPTH)
+    .FIFO_DEPTH(FIFO_DEPTH),
+    .QOS_THROTTLE_WM(6)   // §10: low enough to test with the 4 carry-over outstanding + 2 new hi-QoS
   ) dut (
     .clk(clk),
     .ucie_clk(ucie_clk),
@@ -122,6 +124,7 @@ module tb_chi_to_ucie_bridge;
     .pm_l1_active(pm_l1_active),
     .err_inj_en(err_inj_en),
     .qos_hi_cnt(qos_hi_cnt),
+    .qos_lo_stall_cnt(qos_lo_stall_cnt),
     .drain_done(drain_done),
     .crc_err_cnt(crc_err_cnt),
     .tag_err_cnt(tag_err_cnt),
@@ -903,6 +906,100 @@ module tb_chi_to_ucie_bridge;
       end
       @(posedge clk);
       chi_rsp_ready = 1'b0;
+    end
+
+    $display("INFO: §10 QoS watermark throttle: low-QoS stalled at WM=6");
+    begin : qos_throttle
+      // At this point 4 carry-over outstanding txns (from §6.4) keep outstanding=4.
+      // QOS_THROTTLE_WM=6 in the DUT. Issue 2 hi-QoS reads to reach 4+2=6=WM.
+      reg [7:0]  hi_tag1;
+      reg [7:0]  hi_tag2;
+      reg [15:0] stall_before;
+
+      // Hi-QoS read 1 (QoS=0xF, bypasses throttle): outstanding → 5
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_READNOSNP;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'h1234_0000_0001;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hF1;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h01;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h6;
+      chi_req_data[CHI_REQ_QOS_LSB    +: CHI_REQ_QOS_W]    = 4'hF;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      wait (ucie_tx_hdr_valid);
+      hi_tag1 = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+
+      // Hi-QoS read 2: outstanding → 6 = WM
+      @(posedge clk);
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'hF2;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'h1234_0000_0002;
+      chi_req_valid = 1'b1;
+      while (!chi_req_ready) @(posedge clk);
+      @(posedge clk);
+      chi_req_valid = 1'b0;
+      wait (ucie_tx_hdr_valid);
+      hi_tag2 = ucie_tx_hdr[UCIE_TAG_MSB:UCIE_TAG_LSB];
+      @(posedge ucie_clk);
+
+      // Wait for CDC (outstanding_above_wm=1 propagates to clk domain after ~2 clk edges).
+      repeat (6) @(posedge clk);
+
+      // Drive a lo-QoS read: must be stalled (chi_req_ready=0).
+      stall_before = qos_lo_stall_cnt;
+      @(posedge clk);
+      chi_req_data = {CHI_REQ_W{1'b0}};
+      chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W] = CHI_REQ_READNOSNP;
+      chi_req_data[CHI_REQ_ADDR_LSB   +: CHI_REQ_ADDR_W]   = 48'h5678_0000_0001;
+      chi_req_data[CHI_REQ_TXNID_LSB  +: CHI_REQ_TXNID_W]  = 8'h10;
+      chi_req_data[CHI_REQ_SRCID_LSB  +: CHI_REQ_SRCID_W]  = 7'h12;
+      chi_req_data[CHI_REQ_SIZE_LSB   +: CHI_REQ_SIZE_W]   = 3'h6;
+      chi_req_data[CHI_REQ_QOS_LSB    +: CHI_REQ_QOS_W]    = 4'h0;
+      chi_req_valid = 1'b1;
+      #1;
+      if (chi_req_ready) begin
+        $display("FAIL: §10: lo-QoS request not stalled when outstanding >= WM"); $finish(1);
+      end
+      repeat (2) @(posedge clk); #1;
+      if (chi_req_ready) begin
+        $display("FAIL: §10: lo-QoS request not stalled (2nd check)"); $finish(1);
+      end
+      chi_req_valid = 1'b0;
+
+      // stall counter must have incremented.
+      repeat (2) @(posedge clk);
+      if (qos_lo_stall_cnt <= stall_before) begin
+        $display("FAIL: §10: qos_lo_stall_cnt did not increment (was %0d, now %0d)",
+                 stall_before, qos_lo_stall_cnt); $finish(1);
+      end
+
+      // Complete both hi-QoS reads (MEM_CPL bursts) → outstanding drops to 4 < WM.
+      drive_rx_burst(hi_tag1, 512'h0, 3'h6);
+      drive_rx_burst(hi_tag2, 512'h0, 3'h6);
+
+      // Wait for CDC to clear (outstanding_above_wm_clk → 0).
+      repeat (6) @(posedge clk);
+
+      // lo-QoS read must now be accepted.
+      @(posedge clk);
+      chi_req_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] = 4'h0;
+      chi_req_valid = 1'b1;
+      fork : lo_qos_unblock
+        begin
+          while (!chi_req_ready) @(posedge clk);
+          disable lo_qos_unblock;
+        end
+        begin
+          repeat (32) @(posedge clk);
+          $display("FAIL: §10: lo-QoS never unblocked after outstanding < WM");
+          $finish(1);
+        end
+      join
+      @(posedge clk);
+      chi_req_valid = 1'b0;
     end
 
     $display("PASS CHI-to-UCIe bridge directed smoke");

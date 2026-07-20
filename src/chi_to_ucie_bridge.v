@@ -20,7 +20,8 @@ module chi_to_ucie_bridge #(
   parameter integer FIFO_DEPTH      = 8,
   parameter integer TX_HDR_CREDITS  = 8,
   parameter integer TX_DAT_CREDITS  = 8,
-  parameter integer MAX_OUTSTANDING = 32
+  parameter integer MAX_OUTSTANDING = 32,
+  parameter integer QOS_THROTTLE_WM = MAX_OUTSTANDING / 2
 ) (
   input  wire                     clk,
   input  wire                     ucie_clk,
@@ -87,7 +88,9 @@ module chi_to_ucie_bridge #(
   output reg  [15:0]              tag_err_cnt,
   output reg  [15:0]              drain_cnt,
   // QoS observability (§5.4): counts UCIe headers issued with CHI QoS >= 8.
-  output reg  [15:0]              qos_hi_cnt
+  output reg  [15:0]              qos_hi_cnt,
+  // §10: counts cycles a low-QoS request is held off by the watermark.
+  output reg  [15:0]              qos_lo_stall_cnt
 );
 
   localparam integer LTAG_W = $clog2(MAX_OUTSTANDING);
@@ -131,6 +134,10 @@ module chi_to_ucie_bridge #(
   wire data_fire;
   wire rx_hdr_fire = ucie_rx_hdr_valid && ucie_rx_hdr_ready;
   wire rx_dat_fire = ucie_rx_data_valid && ucie_rx_data_ready;
+
+  // §10: QoS watermark CDC (declared early; driven after txn_table below)
+  wire outstanding_above_wm;      // ucie_clk domain
+  wire outstanding_above_wm_clk;  // clk domain (2-flop CDC)
 
   // Multi-beat burst counters (§4.3 / §6.1)
   reg [2:0] tx_dat_beat_ctr;
@@ -223,10 +230,12 @@ module chi_to_ucie_bridge #(
   // ---------------------------------------------------------------------------
   // CHI host-domain enqueue
   // ---------------------------------------------------------------------------
-  wire chi_req_is_write = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire chi_req_is_read  = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire chi_req_is_cmo   = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
-  wire req_supported    = chi_req_is_write || chi_req_is_read || chi_req_is_cmo;
+  wire chi_req_is_write  = is_chi_write(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire chi_req_is_read   = is_chi_read(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire chi_req_is_cmo    = is_chi_cmo(chi_req_data[CHI_REQ_OPCODE_LSB +: CHI_REQ_OPCODE_W]);
+  wire req_supported     = chi_req_is_write || chi_req_is_read || chi_req_is_cmo;
+  wire chi_req_is_qos_hi = chi_req_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8;  // §10
+  wire throttle_lo       = outstanding_above_wm_clk && !chi_req_is_qos_hi;             // §10
 
   // §7.1: an unsupported opcode is accepted and answered with a CHI RSP carrying
   // RespErr (NDERR) via a local clk-domain error-response FIFO, instead of the
@@ -268,10 +277,10 @@ module chi_to_ucie_bridge #(
   wire [WBUF_AW-1:0] wr_dbid    = chi_wr_data[CHI_DAT_TXNID_LSB +: WBUF_AW];
   wire               wr_dat_hit = dbid_valid[wr_dbid];
 
-  wire rd_req_ready  = chi_req_is_read  && cap_open && !req_w_full;
-  wire wr_req_ready  = chi_req_is_write && cap_open && !dbid_pool_full && !dbid_rsp_w_full;
+  wire rd_req_ready  = chi_req_is_read  && cap_open && !req_w_full  && !throttle_lo;
+  wire wr_req_ready  = chi_req_is_write && cap_open && !dbid_pool_full && !dbid_rsp_w_full && !throttle_lo;
   wire err_req_ready = chi_req_is_err   && cap_open && !err_rsp_w_full;
-  wire cmo_req_ready = chi_req_is_cmo   && cap_open && !req_w_full;   // §8: CMO, header-only
+  wire cmo_req_ready = chi_req_is_cmo   && cap_open && !req_w_full   && !throttle_lo;  // §8
   wire wr_dat_ready  = wr_dat_hit       && cap_open && !req_w_full && !wdat_w_full;
 
   assign chi_req_ready     = rd_req_ready || wr_req_ready || err_req_ready || cmo_req_ready;
@@ -437,6 +446,12 @@ module chi_to_ucie_bridge #(
     .b_txnid(b_txnid), .b_srcid(b_srcid), .b_is_write(b_is_write), .b_valid(b_valid),
     .b_is_large(b_is_large),
     .outstanding(outstanding), .tag_err(tbl_tag_err)
+  );
+
+  // §10: compare outstanding count against watermark in ucie_clk domain; CDC to clk.
+  assign outstanding_above_wm = (outstanding >= QOS_THROTTLE_WM[LTAG_W:0]);
+  cdc_sync #(.STAGES(2)) u_qos_wm_cdc (
+    .clk(clk), .rst_n(clk_rst_n), .d(outstanding_above_wm), .q(outstanding_above_wm_clk)
   );
 
   // ---------------------------------------------------------------------------
@@ -628,6 +643,17 @@ module chi_to_ucie_bridge #(
       qos_hi_cnt <= 16'h0;
     else if (hdr_fire && req_r_data[CHI_REQ_QOS_LSB +: CHI_REQ_QOS_W] >= 4'd8)
       qos_hi_cnt <= qos_hi_cnt + 1'b1;
+  end
+
+  // §10: low-QoS stall counter: counts clk cycles where a valid low-QoS request
+  // is held off by the outstanding watermark.
+  always @(posedge clk or negedge clk_rst_n) begin
+    if (!clk_rst_n)
+      qos_lo_stall_cnt <= 16'h0;
+    else if (!bridge_open)
+      qos_lo_stall_cnt <= 16'h0;
+    else if (throttle_lo && chi_req_valid)
+      qos_lo_stall_cnt <= qos_lo_stall_cnt + 1'b1;
   end
 
   assign ucie_tx_data_valid = bridge_open_ucie && !wdat_r_empty && !wq_empty && dat_crdt_avail;

@@ -1039,7 +1039,9 @@ async def test_txn_table_full(dut):
     cocotb.start_soon(hdr_crdt_returner())
 
     for i in range(N):
-        dut.chi_req_data.value = make_chi_read(i & 0xFF, 0x3000_0000_0000 + i * 64)
+        # Use hi-QoS to bypass the QoS watermark throttle (§10) while filling
+        # all MAX_OUTSTANDING=32 slots — this test targets tbl_full, not throttle.
+        dut.chi_req_data.value = make_chi_read(i & 0xFF, 0x3000_0000_0000 + i * 64, qos=0xF)
         dut.chi_req_valid.value = 1
         for _ in range(300):
             await RisingEdge(dut.clk)
@@ -1063,8 +1065,9 @@ async def test_txn_table_full(dut):
     dut.ucie_rx_hdr_crdt.value = 0
     await ClockCycles(dut.ucie_clk, 4)
 
-    # One more read: must not produce a UCIe header (txn_table full).
-    dut.chi_req_data.value = make_chi_read(0xFF, 0x9999_0000_0000)
+    # One more read: must not produce a UCIe header (txn_table full). Use hi-QoS
+    # to ensure throttle is not the gating factor here — only tbl_full should apply.
+    dut.chi_req_data.value = make_chi_read(0xFF, 0x9999_0000_0000, qos=0xF)
     dut.chi_req_valid.value = 1
     for _ in range(20):
         await RisingEdge(dut.ucie_clk)
@@ -1673,3 +1676,100 @@ async def test_cmo_ops(dut):
         assert got_rsp, f"CMO 0x{opcode:02x}: no CHI Comp RSP"
 
     dut._log.info("CMO: CleanShared/CleanSharedPersist/CleanInvalid/MakeInvalid all OK")
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def test_qos_throttle(dut):
+    """§10: QoS watermark throttle.
+
+    Issues QOS_THROTTLE_WM (=16, default MAX_OUTSTANDING/2) hi-QoS reads without
+    completing them; verifies a subsequent lo-QoS read sees chi_req_ready=0 and that
+    qos_lo_stall_cnt increments; then drains outstanding reads and confirms the lo-QoS
+    read is accepted after the watermark clears.
+    """
+    await reset_and_open(dut)
+    dut.ucie_tx_hdr_ready.value   = 1
+    dut.ucie_tx_data_ready.value  = 1
+    dut.chi_rsp_ready.value       = 1
+    dut.chi_comp_data_ready.value = 1
+
+    WM = 16  # must match QOS_THROTTLE_WM = MAX_OUTSTANDING/2 = 32/2
+    tags = []
+    state = dict(running=True)
+
+    # Return one HDR credit per accepted header so TX_HDR_CREDITS=8 never depletes.
+    async def hdr_crdt_returner():
+        while state["running"]:
+            await RisingEdge(dut.ucie_clk)
+            if dut.ucie_tx_hdr_valid.value == 1 and dut.ucie_tx_hdr_ready.value == 1:
+                tags.append(field(int(dut.ucie_tx_hdr.value), UCIE_TAG_LSB, 8))
+                dut.ucie_rx_hdr_crdt.value = 1
+            else:
+                dut.ucie_rx_hdr_crdt.value = 0
+
+    cocotb.start_soon(hdr_crdt_returner())
+
+    # Issue WM hi-QoS reads; do NOT complete them so outstanding stays at WM.
+    for i in range(WM):
+        dut.chi_req_data.value  = make_chi_read(0x80 + i, 0x1000 + i * 64, qos=0xF)
+        dut.chi_req_valid.value = 1
+        for _ in range(300):
+            await RisingEdge(dut.clk)
+            if dut.chi_req_ready.value == 1:
+                dut.chi_req_valid.value = 0
+                break
+        else:
+            raise AssertionError(f"hi-QoS read {i} never accepted")
+
+    # Wait for all WM UCIe TX headers to fire.
+    for _ in range(2000):
+        await RisingEdge(dut.ucie_clk)
+        if len(tags) >= WM:
+            break
+    assert len(tags) >= WM, f"only {len(tags)}/{WM} UCIe TX headers observed"
+
+    # CDC latency: outstanding_above_wm_clk must propagate to clk domain (~2 clk cycles).
+    await ClockCycles(dut.clk, 6)
+
+    # A lo-QoS read must be stalled: chi_req_ready must be 0.
+    dut.chi_req_data.value  = make_chi_read(0x01, 0x5000_0000_0000, qos=0)
+    dut.chi_req_valid.value = 1
+    await RisingEdge(dut.clk)
+    stalled1 = int(dut.chi_req_ready.value) == 0
+    await RisingEdge(dut.clk)
+    stalled2 = int(dut.chi_req_ready.value) == 0
+    assert stalled1 and stalled2, \
+        "lo-QoS read not stalled when outstanding == QOS_THROTTLE_WM"
+    dut.chi_req_valid.value = 0
+
+    # stall counter must have incremented.
+    await ClockCycles(dut.clk, 2)
+    stall_cnt = int(dut.qos_lo_stall_cnt.value)
+    assert stall_cnt > 0, f"qos_lo_stall_cnt={stall_cnt}, expected > 0"
+
+    state["running"] = False
+    await ClockCycles(dut.ucie_clk, 2)
+
+    # Complete all WM hi-QoS reads so outstanding drops to 0 < WM.
+    for tag in tags[:WM]:
+        await _send_rx_data_burst(dut, pack_mem_cpl_burst(tag, 0, size=6))
+
+    # CDC latency: outstanding_above_wm_clk must clear.
+    await ClockCycles(dut.clk, 8)
+
+    # lo-QoS read must now be accepted.
+    dut.chi_req_data.value  = make_chi_read(0x01, 0x5000_0000_0000, qos=0)
+    dut.chi_req_valid.value = 1
+    accepted = False
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        if int(dut.chi_req_ready.value) == 1:
+            accepted = True
+            break
+    dut.chi_req_valid.value = 0
+    assert accepted, "lo-QoS read still stalled after outstanding dropped below WM"
+
+    dut._log.info(
+        f"QoS throttle OK: stall verified at WM={WM}, "
+        f"qos_lo_stall_cnt={stall_cnt}; lo-QoS resumed after drain"
+    )
