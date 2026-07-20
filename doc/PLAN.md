@@ -796,6 +796,72 @@ CDC), `snp_dat_r_empty_clk` (2-flop CDC).
 
 ---
 
+## Phase 11 — CHI Atomic Transactions (branch: phase7-chi-deepening)
+
+CHI defines four atomic operation classes: `AtomicStore` (no return), `AtomicLoad`,
+`AtomicSwap`, and `AtomicCompare` (all return the old cache-line value).
+
+### Design
+
+Atomics reuse the DBID two-phase write flow exactly:
+
+1. CHI master sends REQ (atomic opcode) → bridge allocates a DBID entry and
+   returns `DBIDResp` (same path as Phase 7.2 writes).
+2. CHI master echoes DBID in `WriteData` TxnID with the operand in `data[63:0]`.
+3. Bridge assembles a two-beat UCIE burst with `kind = UCIE_PKT_KIND_ATOM (4'hF)`.
+4. Far side executes the atomic and responds:
+   - `AtomicStore`: single `AD_CPL` → existing `u_rsp_fifo` → CHI `Comp` (no
+     new RX code).
+   - `AtomicLoad/Swap/Compare`: two-beat `MEM_CPL` burst (length = `0x10`) →
+     existing `u_rdat_fifo` → CHI `CompData` with the old value (no new RX code).
+
+### New definitions (`src/chi_ucie_bridge_defs.vh`)
+
+- `UCIE_PKT_KIND_ATOM = 4'hF`
+- Opcodes: `CHI_REQ_ATOMICSTORE_ADD = 7'h20`, `CHI_REQ_ATOMICLOAD_ADD = 7'h28`,
+  `CHI_REQ_ATOMICSWAP = 7'h30`, `CHI_REQ_ATOMICCOMPARE = 7'h31`
+- `is_chi_atomic()` — returns 1 for all four opcodes
+- `is_chi_atomic_store()` — returns 1 for `AtomicStore` only
+
+### ATOM header encoding
+
+| Field | Value |
+|:---|:---|
+| `kind` | `UCIE_PKT_KIND_ATOM (0xF)` |
+| `code[3:0]` | `opcode[3:0]` — sub-operation selector |
+| `attr[7]` | `has_ret` — 1 for Load/Swap/Compare, 0 for Store |
+| `attr[6:4]` | `order[2:0]` (CHI ordering field) |
+| `attr[3:0]` | `qos[3:0]` |
+
+### RTL changes (`src/chi_to_ucie_bridge.v`)
+
+- `translate_chi_req_to_ucie`: added ATOM branch (kind/code/attr assignment).
+- `translate_chi_data_to_ucie`: added `is_atom` input; beat-0 descriptor uses
+  `UCIE_PKT_KIND_ATOM` instead of `AD_REQ` for atomic operand bursts.
+- `chi_req_is_atomic` wire; `atom_req_ready`/`atom_req_accept` (same conditions
+  as write, gated by DBID pool).
+- `chi_req_ready` OR updated to include `atom_req_ready`.
+- DBID alloc and `wpend_req` write enabled by `wr_req_accept || atom_req_accept`.
+- `wtag_mem` widened from `[LTAG_W+2:0]` to `[LTAG_W+3:0]`: MSB is `is_atom`
+  flag, read as `wq_front_is_atom` to switch beat-0 kind on data burst.
+- `wq_push` updated: `req_hdr_fire && (req_head_is_write || req_head_is_atomic)`.
+
+### Verification
+
+- Directed testbench `§11A` (AtomicStoreAdd): DBID flow, operand burst check
+  (`kind=0xF, code=0x0, attr[7]=0`, data[63:0]=0x42), AD_CPL injection, Comp
+  verify.
+- Directed testbench `§11B` (AtomicLoadAdd): DBID flow, operand burst check
+  (`kind=0xF, code=0x8, attr[7]=1`), two-beat MEM_CPL injection with return
+  value `0xDEAD_BEEF_0000_0000`, CompData verify.
+- cocotb `test_atomic_store` + `test_atomic_load`: same flows under Verilator.
+  **22/22 PASS**.
+- Formal: all 5 SymbiYosys targets pass.
+- Synth: 61,340 cells (+150 vs Phase 9 — minimal wq widening), no latches.
+  Commit: `72bcc54`.
+
+---
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
