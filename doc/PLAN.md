@@ -862,6 +862,54 @@ Atomics reuse the DBID two-phase write flow exactly:
 
 ---
 
+## Phase 12 — DVMOp + Ordering Barriers (branch: phase7-chi-deepening)
+
+CHI DVMOp (TLB/DVM invalidation, opcode 0x10), EOBarrier (0x14), and ECBarrier (0x15) are
+header-only requests that complete via a single Comp response, exactly like CMO.
+
+### Design
+
+All three flow through the existing `u_req_fifo` and complete via the AD_CPL→Comp path
+already used by reads and CMOs. No new RX logic is needed.
+
+### New definitions (`src/chi_ucie_bridge_defs.vh`)
+
+- `UCIE_PKT_KIND_DVM = 4'h7` (uses lower-nibble space, all values 0x0–0x7 were free)
+- Opcodes: `CHI_REQ_DVMOP = 7'h10`, `CHI_REQ_EOBARRIER = 7'h14`, `CHI_REQ_ECBARRIER = 7'h15`
+- `is_chi_dvm()` — returns 1 for all three opcodes
+
+### DVM header encoding
+
+| Field | Value |
+|:---|:---|
+| `kind` | `UCIE_PKT_KIND_DVM (0x7)` |
+| `code[3:0]` | `opcode[3:0]` — 0x0=DVMOp, 0x4=EOBarrier, 0x5=ECBarrier |
+| `attr[5:4]` | `order[1:0]` |
+| `attr[3:0]` | `qos[3:0]` |
+| `addr[47:0]` | CHI addr field verbatim — carries DVM message payload for DVMOp |
+
+### RTL changes (`src/chi_to_ucie_bridge.v`)
+
+- `chi_req_is_dvm` wire; `dvm_req_ready`/`dvm_req_accept` (header-only, same
+  back-pressure conditions as CMO: `cap_open && !req_w_full && !throttle_lo`).
+- `req_supported` updated to include DVM.
+- `chi_req_ready` OR updated to include `dvm_req_ready`.
+- `req_w_en` updated: `rd_req_accept || wr_dat_accept || cmo_req_accept || dvm_req_accept`.
+- `req_head_is_dvm` wire; added to `alloc_is_large` guard (`!req_head_is_dvm`) since
+  DVM never triggers a data completion.
+- `translate_chi_req_to_ucie`: DVM branch (between ATOM and AD_REQ).
+
+### Verification
+
+- Directed testbench `§12`: loops over all three opcodes, checking kind=DVM,
+  code=opcode[3:0], addr forwarding for DVMOp, then injects AD_CPL and verifies Comp.
+- cocotb `test_dvm_ops`: same flow under Verilator. **23/23 PASS**.
+- Formal: all 5 SymbiYosys targets pass.
+- Synth: 61,373 cells (+33 vs Phase 11 — 3 new opcodes, 1 new function), no latches.
+  Commit: `4c69a83`.
+
+---
+
 ## UVM Testbench — verification/uvm/ (complete, requires commercial simulator)
 
 Full UVM-1.2 environment targeting a commercial EDA tool (Xcelium / VCS):
