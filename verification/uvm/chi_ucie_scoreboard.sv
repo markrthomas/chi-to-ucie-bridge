@@ -111,7 +111,8 @@ class chi_ucie_scoreboard extends uvm_scoreboard;
       cpl.data     = '0;
       cpl.is_burst = 1'b1;
     end
-    cpl_mbox.put(cpl);
+    cpl_mbox.try_put(cpl);  // non-blocking: unbounded mailbox, and put() (a
+                            // blocking task) is illegal inside a function
   endfunction
 
   virtual function void write_ucie_tx_dat(ucie_item item);
