@@ -154,5 +154,8 @@ the beat-0 header.
 | QoS | `attr[3:0]` carries QoS end-to-end; no weighted-arbitration or per-class queuing. |
 | Formal depth | BMC depth 8–16; unbounded proof of async-FIFO not attempted. |
 
+## Future Upgrades and Plans
+- Planning in work as of 2 Sept. 2026
+
 See [doc/design-spec.md](doc/design-spec.md) for the full design description and
 [doc/PLAN.md](doc/PLAN.md) for phase history.
