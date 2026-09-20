@@ -50,7 +50,11 @@ graph LR
 
 ## Quick Start
 
+`make help` lists all targets; see [DV_STANDARDS.md](DV_STANDARDS.md) for the
+common `make` target vocabulary shared across this maintainer's RTL/DV repos.
+
 ```bash
+make check            # light local gate: lint + sim
 make regress          # Verilator lint + Icarus directed simulation
 make ci               # regress + formal + synthesis (full gate)
 
@@ -58,6 +62,7 @@ make sim              # directed testbench only (Icarus)
 make vcd              # directed testbench with waveform
 make vlt-vcd          # Verilator trace harness waveform
 
+make cocotb           # 16 cocotb tests (SIM=icarus|verilator); `make test` alias
 make coverage         # Verilator coverage + SVA run -> sim/coverage.info
 cd verification/cocotb && make SIM=verilator   # 16 cocotb tests + coverage
 make coverage-all     # merge directed + cocotb -> sim/coverage_merged.info

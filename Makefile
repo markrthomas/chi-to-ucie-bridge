@@ -27,14 +27,18 @@ SVA_ARGS := --assert +define+BRIDGE_SVA
 COV_DIR  := sim/obj_dir_cov
 COCOTB_COV := verification/cocotb/coverage.dat
 
-.PHONY: help lint sim regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
+.PHONY: help lint sim cocotb test check regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
 
 help:
 	@echo "chi-to-ucie-bridge - common targets"
+	@echo "(cross-repo target vocabulary: see DV_STANDARDS.md)"
 	@echo ""
 	@echo "  make lint      - Verilator --lint-only on RTL"
 	@echo "  make sim       - Icarus directed simulation"
 	@echo "  make stress    - directed simulation stress alias"
+	@echo "  make cocotb    - cocotb regression (verification/cocotb; SIM=icarus|verilator)"
+	@echo "  make test      - alias for make cocotb"
+	@echo "  make check     - light local gate: lint + sim"
 	@echo "  make vcd       - Icarus sim dumping verification/directed/build/waves.vcd"
 	@echo "  make gtkwave   - make vcd, then open the Icarus VCD"
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
@@ -56,6 +60,14 @@ sim:
 
 stress:
 	$(MAKE) -C verification/directed stress
+
+cocotb:
+	$(MAKE) -C verification/cocotb
+
+test: cocotb
+
+check: lint sim
+	@echo "[CHECK] lint + sim PASSED"
 
 vcd:
 	$(MAKE) -C verification/directed vcd
