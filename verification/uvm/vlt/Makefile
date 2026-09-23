@@ -18,7 +18,11 @@ UVM_HDR := $(UVM_HOME)/uvm_pkg_all_v2020_3_1_dpi.svh
 UVM_DPI := $(UVM_HOME)/v2020_3_1/dpi/uvm_dpi.cc
 
 BUILD_JOBS ?= 1
-UVM_TEST   ?= base_test
+# base_test drives no sequence at all; the default here must be a randomized
+# test with real transactions (DV_STANDARDS.md), so read_write_test (20
+# random CHI reads/writes via chi_read_write_seq) is the default, not the
+# empty base_test.
+UVM_TEST   ?= read_write_test
 
 VFLAGS ?= --binary --timing --vpi -j $(BUILD_JOBS) --build-jobs $(BUILD_JOBS) \
           -Wno-fatal -Wno-COVERIGN -Wno-TIMESCALEMOD --CFLAGS -O0

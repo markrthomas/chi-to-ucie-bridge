@@ -19,8 +19,11 @@ V=~/verilator/bin/verilator ; U=~/verilator/test_regress/t/uvm
 ( unset VERILATOR_ROOT; make -C verification/uvm/vlt lint  VERILATOR=$V UVM_HOME=$U )  # RAM-safe
 ( unset VERILATOR_ROOT; make -C verification/uvm/vlt smoke VERILATOR=$V UVM_HOME=$U )  # build + run
 ```
-Top `tb_top`; test via `+UVM_TESTNAME` (default `base_test`, override with
-`UVM_TEST=<name>`). The `--binary` build belongs in CI
+Top `tb_top`; test via `+UVM_TESTNAME` (default `read_write_test` — a
+randomized mix of 20 CHI reads/writes via `chi_read_write_seq`, per
+DV_STANDARDS.md's default-test-is-random convention; override with
+`UVM_TEST=<name>`, e.g. `UVM_TEST=base_test` for the empty elaboration-only
+test). The `--binary` build belongs in CI
 (`.github/workflows/verilator-uvm.yml`), not a RAM-constrained host.
 
 ## `uvm_macros.svh`
