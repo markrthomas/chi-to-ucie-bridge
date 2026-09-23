@@ -10,9 +10,8 @@ IFS      = chi_if.sv ucie_if.sv
 TOP      = tb_top.sv
 
 # Compilation & Simulation targets (placeholder for commercial tool)
-# Example for Xcelium (read_write_test is the default random test; see
-# verification/uvm/vlt/Makefile's UVM_TEST for the open-source Verilator flow):
-# xrun -64bit -uvm -sv +incdir+../../src +incdir+. $(PKGS) $(IFS) $(TOP) +UVM_TESTNAME=read_write_test
+# Example for Xcelium:
+# xrun -64bit -uvm -sv +incdir+../../src +incdir+. $(PKGS) $(IFS) $(TOP) +UVM_TESTNAME=base_test
 
 clean:
 	rm -rf xcelium.d xrun.log xrun.history
