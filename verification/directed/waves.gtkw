@@ -1,0 +1,124 @@
+[*]
+[*] Curated GTKWave layout for the chi_to_ucie_bridge directed testbench.
+[*] Regenerate after adding TB ports: `make -C verification/directed vcd`,
+[*] then re-save groups in GTKWave against build/waves.vcd.
+[*]
+[dumpfile] "build/waves.vcd"
+[savefile] "waves.gtkw"
+[timestart] 0
+[size] 1000 600
+[pos] -1 -1
+*0.000000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+[sst_width] 276
+[signals_width] 326
+[sst_expanded] 1
+[sst_vpaned_height] 157
+@200
+-== Clocks / Reset ==
+@28
+tb_chi_to_ucie_bridge.clk
+tb_chi_to_ucie_bridge.ucie_clk
+tb_chi_to_ucie_bridge.rst_n
+tb_chi_to_ucie_bridge.phy_init_done
+tb_chi_to_ucie_bridge.link_error
+tb_chi_to_ucie_bridge.link_state[1:0]
+tb_chi_to_ucie_bridge.retrain_req
+@200
+-== CHI REQ / WriteData (TB -> DUT) ==
+@28
+tb_chi_to_ucie_bridge.chi_req_valid
+tb_chi_to_ucie_bridge.chi_req_ready
+@22
+tb_chi_to_ucie_bridge.chi_req_data[89:0]
+@28
+tb_chi_to_ucie_bridge.chi_wr_data_valid
+tb_chi_to_ucie_bridge.chi_wr_data_ready
+@22
+tb_chi_to_ucie_bridge.chi_wr_data[597:0]
+@200
+-== CHI RSP / CompData (DUT -> TB) ==
+@28
+tb_chi_to_ucie_bridge.chi_rsp_valid
+tb_chi_to_ucie_bridge.chi_rsp_ready
+@22
+tb_chi_to_ucie_bridge.chi_rsp_data[24:0]
+@28
+tb_chi_to_ucie_bridge.chi_comp_data_valid
+tb_chi_to_ucie_bridge.chi_comp_data_ready
+@22
+tb_chi_to_ucie_bridge.chi_comp_data[597:0]
+@200
+-== CHI Snoop (SS9) ==
+@28
+tb_chi_to_ucie_bridge.chi_snp_valid
+tb_chi_to_ucie_bridge.chi_snp_ready
+@22
+tb_chi_to_ucie_bridge.chi_snp_data[69:0]
+@28
+tb_chi_to_ucie_bridge.chi_snp_rsp_valid
+tb_chi_to_ucie_bridge.chi_snp_rsp_ready
+@22
+tb_chi_to_ucie_bridge.chi_snp_rsp_data[21:0]
+@28
+tb_chi_to_ucie_bridge.chi_snp_rsp_dat_valid
+tb_chi_to_ucie_bridge.chi_snp_rsp_dat_ready
+@22
+tb_chi_to_ucie_bridge.chi_snp_rsp_dat_data[597:0]
+@200
+-== UCIe TX (DUT -> link) ==
+@28
+tb_chi_to_ucie_bridge.ucie_tx_hdr_valid
+tb_chi_to_ucie_bridge.ucie_tx_hdr_ready
+@22
+tb_chi_to_ucie_bridge.ucie_tx_hdr[127:0]
+@28
+tb_chi_to_ucie_bridge.ucie_tx_hdr_crdt
+tb_chi_to_ucie_bridge.ucie_tx_data_valid
+tb_chi_to_ucie_bridge.ucie_tx_data_ready
+@22
+tb_chi_to_ucie_bridge.ucie_tx_data[127:0]
+tb_chi_to_ucie_bridge.ucie_tx_data_be[63:0]
+@28
+tb_chi_to_ucie_bridge.ucie_tx_dat_crdt
+@200
+-== UCIe RX (link -> DUT) ==
+@28
+tb_chi_to_ucie_bridge.ucie_rx_hdr_valid
+tb_chi_to_ucie_bridge.ucie_rx_hdr_ready
+@22
+tb_chi_to_ucie_bridge.ucie_rx_hdr[127:0]
+@28
+tb_chi_to_ucie_bridge.ucie_rx_hdr_crdt
+tb_chi_to_ucie_bridge.ucie_rx_data_valid
+tb_chi_to_ucie_bridge.ucie_rx_data_ready
+@22
+tb_chi_to_ucie_bridge.ucie_rx_data[127:0]
+@28
+tb_chi_to_ucie_bridge.ucie_rx_dat_crdt
+@200
+-== Sideband / Power Management ==
+@28
+tb_chi_to_ucie_bridge.sb_tx_valid
+tb_chi_to_ucie_bridge.sb_tx_ready
+@22
+tb_chi_to_ucie_bridge.sb_tx_data[7:0]
+@28
+tb_chi_to_ucie_bridge.sb_rx_valid
+tb_chi_to_ucie_bridge.sb_rx_ready
+@22
+tb_chi_to_ucie_bridge.sb_rx_data[7:0]
+@28
+tb_chi_to_ucie_bridge.pm_l1_active
+@200
+-== Status / Error Counters ==
+@23
+tb_chi_to_ucie_bridge.qos_hi_cnt[15:0]
+tb_chi_to_ucie_bridge.qos_lo_stall_cnt[15:0]
+tb_chi_to_ucie_bridge.tag_err_cnt[15:0]
+tb_chi_to_ucie_bridge.crc_err_cnt[15:0]
+tb_chi_to_ucie_bridge.drain_cnt[15:0]
+@29
+tb_chi_to_ucie_bridge.drain_done
+tb_chi_to_ucie_bridge.err_inj_en
+[pattern_trace] 1
+[pattern_trace] 0

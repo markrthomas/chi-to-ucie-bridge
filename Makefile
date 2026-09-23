@@ -40,7 +40,7 @@ help:
 	@echo "  make test      - alias for make cocotb"
 	@echo "  make check     - light local gate: lint + sim"
 	@echo "  make vcd       - Icarus sim dumping verification/directed/build/waves.vcd"
-	@echo "  make gtkwave   - make vcd, then open the Icarus VCD"
+	@echo "  make gtkwave   - make vcd, then open the Icarus VCD with the curated waves.gtkw layout"
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
 	@echo "  make vlt-gtkwave - make vlt-vcd, then open the Verilator VCD"
 	@echo "  make regress   - lint + sim"

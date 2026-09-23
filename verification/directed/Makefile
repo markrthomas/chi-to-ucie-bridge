@@ -35,7 +35,7 @@ vcd: compile
 	vvp $(OUT) +vcd
 
 gtkwave: vcd
-	gtkwave $(VCD)
+	gtkwave $(VCD) waves.gtkw
 
 $(OUT): $(SOURCES) | $(BUILD_DIR)
 	iverilog -g2005-sv -I$(SRC_DIR) -o $@ $(SOURCES)
