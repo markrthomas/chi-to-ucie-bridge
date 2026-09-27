@@ -27,7 +27,7 @@ SVA_ARGS := --assert +define+BRIDGE_SVA
 COV_DIR  := sim/obj_dir_cov
 COCOTB_COV := verification/cocotb/coverage.dat
 
-.PHONY: help lint sim cocotb test check regress stress vcd gtkwave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
+.PHONY: help lint sim cocotb test check regress stress vcd gtkwave waves wave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
 
 help:
 	@echo "chi-to-ucie-bridge - common targets"
@@ -41,6 +41,8 @@ help:
 	@echo "  make check     - light local gate: lint + sim"
 	@echo "  make vcd       - Icarus sim dumping verification/directed/build/waves.vcd"
 	@echo "  make gtkwave   - make vcd, then open the Icarus VCD with the curated waves.gtkw layout"
+	@echo "  make waves     - cocotb test_random_traffic, fresh random seed (SEED=n replays) -> FST"
+	@echo "  make wave      - make waves, then open it in GTKWave (layout, zoomed to fit)"
 	@echo "  make vlt-vcd   - Verilator --trace harness dumping sim/obj_dir_vcd/waves.vcd"
 	@echo "  make vlt-gtkwave - make vlt-vcd, then open the Verilator VCD"
 	@echo "  make regress   - lint + sim"
@@ -74,6 +76,32 @@ vcd:
 
 gtkwave:
 	$(MAKE) -C verification/directed gtkwave
+
+# waves / wave: one random test end to end. cocotb test_random_traffic (random
+# R/W with backpressure and out-of-order UCIe completions, scoreboarded) under
+# Icarus with a fresh random TEST_SEED each run (printed; SEED=<n> replays; the
+# plain cocotb regression keeps its fixed seeds), FST via cocotb WAVES=1, then
+# GTKWave with verification/cocotb/waves.gtkw zoomed to fit. cocotb only
+# compiles its dump module into a fresh sim_build, so that is wiped first.
+COCOTB_DIR := verification/cocotb
+WAVE_TEST  ?= test_random_traffic
+WAVE_FST   := $(COCOTB_DIR)/sim_build/chi_to_ucie_bridge.fst
+WAVE_SEED  := $(or $(SEED),$(shell echo $$(( $$(od -An -N4 -tu4 /dev/urandom) % 2147483646 + 1 ))))
+waves:
+	@echo "[WAVE] $(WAVE_TEST) with random seed: SEED=$(WAVE_SEED)"
+	rm -rf $(COCOTB_DIR)/sim_build
+	TEST_SEED=$(WAVE_SEED) $(MAKE) -C $(COCOTB_DIR) WAVES=1 TESTCASE=$(WAVE_TEST)
+	@if grep -q "<failure" $(COCOTB_DIR)/results.xml; then \
+		echo "[WAVE] *** TEST FAILED (SEED=$(WAVE_SEED)) — see $(WAVE_FST) ***"; \
+	else echo "[WAVE] PASS (SEED=$(WAVE_SEED)) — $(WAVE_FST)"; fi
+
+wave: waves
+	@if command -v gtkwave >/dev/null 2>&1; then \
+		echo "[WAVE] opening $(WAVE_FST) with $(COCOTB_DIR)/waves.gtkw"; \
+		exec gtkwave -S $(COCOTB_DIR)/zoom_full.tcl $(WAVE_FST) $(COCOTB_DIR)/waves.gtkw; \
+	else \
+		echo "[WAVE] gtkwave not on PATH — dump is at $(WAVE_FST) (layout: $(COCOTB_DIR)/waves.gtkw)"; \
+	fi
 
 VCD_DIR := sim/obj_dir_vcd
 VLT_VCD := $(VCD_DIR)/waves.vcd
