@@ -60,6 +60,7 @@ make ci               # regress + formal + synthesis (full gate)
 
 make sim              # directed testbench only (Icarus)
 make vcd              # directed testbench with waveform
+make wave             # cocotb random traffic, fresh seed (SEED=<n> replays) -> FST -> GTKWave
 make vlt-vcd          # Verilator trace harness waveform
 
 make cocotb           # 16 cocotb tests (SIM=icarus|verilator); `make test` alias

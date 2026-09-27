@@ -8,11 +8,22 @@
   restored TxnID, which validates the transaction table end to end.
 """
 
+import os
 import random
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles
+
+
+def _seed_rng(dut, default_seed):
+    """Seed `random` with default_seed (reproducible regression) unless
+    TEST_SEED is set, which root `make wave` does with a fresh value."""
+    env = os.environ.get("TEST_SEED", "")
+    seed = int(env, 0) if env else default_seed
+    dut._log.info("RNG seed = %d (0x%X)%s", seed, seed, " from TEST_SEED" if env else "")
+    random.seed(seed)
+
 
 # ---- CHI REQ flit field map (mirrors chi_ucie_bridge_defs.vh) ----
 CHI_REQ_SIZE_LSB = 6
@@ -387,7 +398,7 @@ class Scoreboard:
 @cocotb.test(timeout_time=2, timeout_unit="ms")
 async def test_random_traffic(dut):
     """Randomized read/write stream with backpressure and out-of-order completions."""
-    random.seed(0xC0FFEE)
+    _seed_rng(dut, 0xC0FFEE)
     await reset_and_open(dut)
 
     sb = Scoreboard()
@@ -642,7 +653,7 @@ async def test_random_traffic(dut):
 @cocotb.test(timeout_time=2, timeout_unit="ms")
 async def test_random_errors(dut):
     """Randomized read stream with corrupted-checksum completions."""
-    random.seed(0x5EED5)
+    _seed_rng(dut, 0x5EED5)
     await reset_and_open(dut)
 
     dut.ucie_tx_data_ready.value = 1
