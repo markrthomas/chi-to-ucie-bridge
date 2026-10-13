@@ -178,7 +178,11 @@ coverage-html: coverage-all
 	echo "[COVERAGE-HTML] report in sim/coverage_html/index.html"
 
 formal:
-	$(MAKE) -C verification/formal
+	@if command -v $(SBY) >/dev/null 2>&1; then \
+		$(MAKE) -C verification/formal; \
+	else \
+		echo "[FORMAL] $(SBY) not found; install SymbiYosys (OSS CAD Suite) to run formal"; \
+	fi
 
 synth:
 	@set -e; \
