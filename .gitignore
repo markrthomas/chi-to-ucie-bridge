@@ -24,3 +24,5 @@ __pycache__/
 .pytest_cache/
 NOTES
 verification/cocotb/coverage.dat
+/verification/random/runs/
+/docker/last-run-metrics.json
