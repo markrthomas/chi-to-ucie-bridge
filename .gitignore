@@ -26,3 +26,4 @@ NOTES
 verification/cocotb/coverage.dat
 /verification/random/runs/
 /docker/last-run-metrics.json
+/verification/random/build/
