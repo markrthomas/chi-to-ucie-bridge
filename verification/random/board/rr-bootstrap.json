@@ -1,0 +1,15 @@
+{
+ "worker": "rr-bootstrap",
+ "state": "done",
+ "history": [
+  {
+   "t": "2026-11-18T19:39:55+00:00",
+   "state": "done",
+   "step": null,
+   "msg": "rr flow built, mutation-checked; see final report"
+  }
+ ],
+ "updated": "2026-11-18T19:39:55+00:00",
+ "branch": "swarm/2026-11-18-rr-bootstrap",
+ "sha": "5d62cfc"
+}

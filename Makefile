@@ -27,7 +27,7 @@ SVA_ARGS := --assert +define+BRIDGE_SVA
 COV_DIR  := sim/obj_dir_cov
 COCOTB_COV := verification/cocotb/coverage.dat
 
-.PHONY: help lint sim cocotb test check regress stress vcd gtkwave waves wave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean
+.PHONY: help lint sim cocotb test check regress stress vcd gtkwave waves wave vlt-vcd vlt-gtkwave coverage coverage-all coverage-report coverage-html formal synth ci clean rr-build rr rr-triage rr-replay
 
 help:
 	@echo "chi-to-ucie-bridge - common targets"
@@ -52,7 +52,11 @@ help:
 	@echo "  make coverage-html     - HTML report in sim/coverage_html/ (requires genhtml)"
 	@echo "  make formal    - SymbiYosys smoke targets"
 	@echo "  make synth     - Yosys synthesis smoke"
-	@echo "  make clean     - remove generated artifacts"
+	@echo "  make rr-build  - build the random-regression sim once (verification/random)"
+	@echo "  make rr N=20 JOBS=4 [SEED=1] - seeded random regression -> verification/random/runs/<ts>/results.jsonl"
+	@echo "  make rr-triage RUN=<dir> - cluster failures of a run by signature"
+	@echo "  make rr-replay - rerun verification/random/corpus.json (fixed entries must PASS)"
+	@echo "  make clean    - remove generated artifacts"
 	@echo "  swarm      Swarm A (verification) via Claude Code; swarm-rr = Swarm B (random regression); swarm-dry = show the command"
 	@echo "  batch      the Railway batch (docker/entrypoint.sh ci); board = swarm status; heavy T=<t> = one heavy target at a time"
 	@echo "  swarm-profile / swarm-kit-check   print .claude/swarm.env / check kit drift (shared kit: markrthomas/dv-swarm-kit)"
@@ -205,6 +209,23 @@ clean:
 	$(MAKE) -C verification/directed clean
 	-$(MAKE) -C verification/formal clean
 	rm -rf $(COV_DIR) $(VCD_DIR) sim/coverage.info sim/coverage_merged.info sim/synth.log sim/coverage.dat
+
+# random regression (verification/random/README.md)
+N    ?= 20
+JOBS ?= 4
+SEED ?= 1
+rr-build:
+	python3 verification/random/rr.py build
+
+rr:
+	python3 verification/random/rr.py run --n $(N) --jobs $(JOBS) --seed $(SEED)
+
+rr-triage:
+	@test -n "$(RUN)" || { echo "usage: make rr-triage RUN=<run dir>"; exit 2; }
+	python3 verification/random/rr.py triage $(RUN)
+
+rr-replay:
+	python3 verification/random/rr.py replay
 
 # shared swarm/infra targets (markrthomas/dv-swarm-kit)
 include swarm.mk
